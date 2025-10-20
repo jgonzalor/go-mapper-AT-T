@@ -1,4 +1,4 @@
-# app.py — Go Mapper — Compilador AT&T (single-file v2.4)
+# app.py — Go Mapper — Compilador AT&T (single-file v2.5)
 
 from __future__ import annotations
 import os, io, re, tempfile
@@ -99,8 +99,9 @@ STRICT_ATT_MAP = {
     "id celda": "ci_eci", "id_celda": "ci_eci",
     "latitud": "latitud", "longitud": "longitud",
     "azimuth": "azimuth_deg",
-    # extras conservables
-    "huso": "huso", "uso dw": "uso_dw", "uso_dw": "uso_dw", "uso up": "uso_up", "uso_up": "uso_up",
+    # extras conservables (si llegan)
+    "huso": "huso", "uso dw": "uso_dw", "uso_dw": "uso_dw",
+    "uso up": "uso_up", "uso_up": "uso_up",
     "causa t": "causa_t", "causa_t": "causa_t", "pais": "pais",
 }
 
@@ -339,7 +340,7 @@ CSV_SEPS = [",", ";", "\t", "|"]
 CSV_ENCS = ["utf-8", "latin1"]
 
 def sniff_headers_from_bytes(buf: bytes, filename: str) -> Optional[List[str]]:
-    """Devuelve encabezados detectados del archivo en memoria."""
+    """Detecta encabezados del archivo en memoria."""
     name = filename.lower()
     try:
         if name.endswith((".xlsx", ".xls", ".xlsm")):
@@ -362,7 +363,7 @@ def sniff_headers_from_bytes(buf: bytes, filename: str) -> Optional[List[str]]:
     return None
 
 def rename_with_manual_map(src_path: str, dst_path: str, mapping: Dict[str, Optional[str]]) -> None:
-    """Lee el archivo, renombra columnas (raw->canónicas) y escribe CSV UTF-8 con coma."""
+    """Lee el archivo, renombra columnas (raw->canónicas) y escribe CSV UTF-8."""
     ext = os.path.splitext(src_path)[1].lower()
     if ext in {".xls", ".xlsx", ".xlsm"}:
         df = pd.read_excel(src_path)
@@ -392,7 +393,7 @@ def rename_with_manual_map(src_path: str, dst_path: str, mapping: Dict[str, Opti
 # ==================== UI ====================
 
 st.title("📞 Go Mapper — Compilador AT&T (single-file)")
-st.caption("Modo **estricto AT&T** compatible con seriales Excel en FECHA/HORA y DUR en segundos o HH:MM:SS.")
+st.caption("Modo **estricto AT&T** compatible con FECHA/HORA como serial de Excel o texto, y DUR en segundos o HH:MM:SS.")
 
 st.sidebar.header("Parámetros")
 tz = st.sidebar.text_input("Zona horaria", value="America/Mazatlan")
