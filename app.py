@@ -1,4 +1,4 @@
-# app.py — Go Mapper AT&T (single-file v2.3, con “modo estricto AT&T” y UI)
+# app.py — Go Mapper — Compilador AT&T (single-file v2.4)
 
 from __future__ import annotations
 import os, io, re, tempfile
@@ -11,7 +11,7 @@ import streamlit as st
 
 st.set_page_config(page_title="Go Mapper — Compilador AT&T (single-file)", layout="wide")
 
-# --------- OLC opcional ----------
+# --------- PLUS CODE opcional ----------
 try:
     from openlocationcode import openlocationcode as olc
     _HAS_OLC = True
@@ -54,20 +54,18 @@ def _read_any(path: str) -> pd.DataFrame:
 def _parse_duration_to_seconds(val: Any) -> Optional[int]:
     if pd.isna(val): return None
     if isinstance(val, (int, float)) and not pd.isna(val):
-        # Si viene como número ya son segundos (o Excel-horas fraccionales; lo ajustamos abajo)
         return int(round(float(val)))
     s = str(val).strip()
     if not s: return None
-    if re.match(r"^\d{1,2}:[0-5]\d:[0-5]\d$", s):
+    if re.match(r"^\d{1,2}:[0-5]\d:[0-5]\d$", s):  # HH:MM:SS
         h, m, sec = s.split(":"); return int(h)*3600 + int(m)*60 + int(sec)
-    if re.match(r"^[0-5]?\d:[0-5]\d$", s):
+    if re.match(r"^[0-5]?\d:[0-5]\d$", s):        # MM:SS
         m, sec = s.split(":"); return int(m)*60 + int(sec)
     s2 = re.sub(r"[^0-9]", "", s)
     if s2.isdigit(): return int(s2)
     return None
 
 def _excel_days_to_datetime(series: pd.Series) -> pd.Series:
-    # Excel base 1899-12-30
     return pd.to_datetime(series, unit="d", origin="1899-12-30", errors="coerce")
 
 def _to_local_naive(ts: pd.Timestamp, tz: Optional[str]) -> pd.Timestamp:
@@ -88,42 +86,24 @@ def _maybe_plus(lat: Any, lon: Any) -> Optional[str]:
 
 # ==================== Modo estricto AT&T ====================
 
-# Mapeo exacto (normalizado) de tus encabezados AT&T → columnas canónicas
 STRICT_ATT_MAP = {
+    # encabezados comunes normalizados → canónico
     "no": "registro_id",
-    "serv": "tipo",
-    "t reg": "tipo",
-    "t_reg": "tipo",
-    "tipo com": "tipo",
-    "tipo_com": "tipo",
-    "num a": "numero_a",
-    "num_a": "numero_a",
-    "num a imsi": "imsi",
-    "num_a_imsi": "imsi",
-    "num a imei": "imei",
-    "num_a_imei": "imei",
-    "dest": "numero_b",
-    "id dest": "numero_b",
-    "id_dest": "numero_b",
-    "fecha": "fecha",
-    "hora": "hora",
+    "serv": "tipo", "t reg": "tipo", "t_reg": "tipo", "tipo com": "tipo", "tipo_com": "tipo",
+    "num a": "numero_a", "num_a": "numero_a",
+    "num a imsi": "imsi", "num_a_imsi": "imsi",
+    "num a imei": "imei", "num_a_imei": "imei",
+    "dest": "numero_b", "id dest": "numero_b", "id_dest": "numero_b",
+    "fecha": "fecha", "hora": "hora",
     "dur": "duracion_seg",
-    "id celda": "ci_eci",
-    "id_celda": "ci_eci",
-    "latitud": "latitud",
-    "longitud": "longitud",
+    "id celda": "ci_eci", "id_celda": "ci_eci",
+    "latitud": "latitud", "longitud": "longitud",
     "azimuth": "azimuth_deg",
-    # extras que podemos conservar si llegan:
-    "huso": "huso",
-    "uso dw": "uso_dw",
-    "uso_up": "uso_up",
-    "uso up": "uso_up",
-    "causa t": "causa_t",
-    "causa_t": "causa_t",
-    "pais": "pais",
+    # extras conservables
+    "huso": "huso", "uso dw": "uso_dw", "uso_dw": "uso_dw", "uso up": "uso_up", "uso_up": "uso_up",
+    "causa t": "causa_t", "causa_t": "causa_t", "pais": "pais",
 }
 
-# Tokens para clasificar Tipo
 _VOZ_OUT = {"mo", "saliente", "orig", "out", "originating", "salida"}
 _VOZ_IN  = {"mt", "entrante", "term", "in", "terminating", "entrada"}
 _MSG     = {"sms", "mensaje", "mensajes", "2 vias", "sms mo", "sms mt"}
@@ -147,8 +127,7 @@ def _dir_voz(tipo: Optional[str]) -> Optional[str]:
     return None
 
 def _strict_att_normalize(raw_df: pd.DataFrame, tz: Optional[str]) -> pd.DataFrame:
-    # 1) Renombrado exacto por normalización
-    orig_cols = list(raw_df.columns)
+    # 1) Renombrado exacto: normaliza encabezados y aplica STRICT_ATT_MAP
     norm_map = {_norm_colname(c): c for c in raw_df.columns}
     rename = {}
     for norm, orig in norm_map.items():
@@ -156,10 +135,8 @@ def _strict_att_normalize(raw_df: pd.DataFrame, tz: Optional[str]) -> pd.DataFra
             rename[orig] = STRICT_ATT_MAP[norm]
     df = raw_df.rename(columns=rename).copy()
 
-    # 2) Campos básicos
-    df["Archivo_Origen"] = df.get("Archivo_Origen")  # lo setea el pipeline
+    # 2) Campos base
     df["Operador"] = "AT&T"
-
     # A/B
     df["Número A"] = df.get("numero_a")
     df["Número B"] = df.get("numero_b")
@@ -171,52 +148,47 @@ def _strict_att_normalize(raw_df: pd.DataFrame, tz: Optional[str]) -> pd.DataFra
         df["Tipo"] = None
     df["Dirección del tráfico (VOZ)"] = df["Tipo"].apply(_dir_voz)
 
-    # Datetime a partir de FECHA/HORA o DATETIME si viniera
+    # 3) Datetime a partir de FECHA/HORA (texto o serial numérico)
     fecha = df.get("fecha")
     hora  = df.get("hora")
     dt = pd.Series([pd.NaT]*len(df), dtype="datetime64[ns]")
 
     if fecha is not None:
-        # Excel serial o texto
-        f_num_mask = pd.to_numeric(fecha, errors="coerce").notna()
-        dt[f_num_mask] = _excel_days_to_datetime(pd.to_numeric(fecha[f_num_mask], errors="coerce"))
-        dt[~f_num_mask] = pd.to_datetime(fecha[~f_num_mask], errors="coerce", dayfirst=True)
+        f_num = pd.to_numeric(fecha, errors="coerce")
+        f_isnum = f_num.notna()
+        if f_isnum.any():
+            dt[f_isnum] = _excel_days_to_datetime(f_num[f_isnum])
+        if (~f_isnum).any():
+            dt[~f_isnum] = pd.to_datetime(fecha[~f_isnum], errors="coerce", dayfirst=True)
 
         if hora is not None:
-            # Hora como texto HH:MM:SS
-            h = hora.astype(str).str.strip()
-            hhmmss = h.str.match(r"^\d{1,2}:[0-5]\d(:[0-5]\d)?$")
-            # Hora numérica: fracción de día o segundos
-            h_num = pd.to_numeric(h, errors="coerce")
-
-            # HH:MM(:SS)
-            dt[hhmmss] = pd.to_datetime(
-                dt[hhmmss].dt.strftime("%Y-%m-%d") + " " + h[hhmmss],
-                errors="coerce",
-            )
-
-            # Numérico (fracción de día si 0–1; si >1 lo tratamos como segundos)
+            h_str = hora.astype(str).str.strip()
+            hhmmss = h_str.str.match(r"^\d{1,2}:[0-5]\d(:[0-5]\d)?$")
+            # caso HH:MM(:SS)
+            idx1 = hhmmss & dt.notna()
+            if idx1.any():
+                dt[idx1] = pd.to_datetime(dt[idx1].dt.strftime("%Y-%m-%d") + " " + h_str[idx1], errors="coerce")
+            # caso numérico (fracción de día o segundos)
+            h_num = pd.to_numeric(h_str, errors="coerce")
             idx_num = h_num.notna() & dt.notna()
             if idx_num.any():
                 frac = h_num.between(0, 1, inclusive="both")
-                secs = (~frac) & idx_num
-                if (idx_num & frac).any():
-                    add = pd.to_timedelta((h_num[idx_num & frac] * 86400).round().astype(int), unit="s")
-                    dt[idx_num & frac] = dt[idx_num & frac] + add
-                if (idx_num & secs).any():
-                    add = pd.to_timedelta(h_num[idx_num & secs].round().astype(int), unit="s")
-                    dt[idx_num & secs] = dt[idx_num & secs] + add
-    else:
-        # Si no hay 'fecha', probamos 'datetime' si venía ya renombrado
-        if "datetime" in df.columns:
-            dt = pd.to_datetime(df["datetime"], errors="coerce", dayfirst=True)
+                idx_frac = idx_num & frac
+                idx_secs = idx_num & (~frac)
+                if idx_frac.any():
+                    add = pd.to_timedelta((h_num[idx_frac] * 86400).round().astype(int), unit="s")
+                    dt[idx_frac] = dt[idx_frac] + add
+                if idx_secs.any():
+                    add = pd.to_timedelta(h_num[idx_secs].round().astype(int), unit="s")
+                    dt[idx_secs] = dt[idx_secs] + add
+    elif "datetime" in df.columns:
+        dt = pd.to_datetime(df["datetime"], errors="coerce", dayfirst=True)
 
     df["Datetime"] = dt.apply(lambda x: _to_local_naive(x, tz) if pd.notna(x) else x)
 
-    # Duración
+    # 4) Duración
     if "duracion_seg" in df.columns:
         dur = df["duracion_seg"].apply(_parse_duration_to_seconds)
-        # Si parece fracción de día (muchos < 1), convertir a segundos
         as_num = pd.to_numeric(df["duracion_seg"], errors="coerce")
         frac_mask = as_num.notna() & (as_num.between(0, 1, inclusive="both"))
         if frac_mask.any():
@@ -224,16 +196,15 @@ def _strict_att_normalize(raw_df: pd.DataFrame, tz: Optional[str]) -> pd.DataFra
             dur.loc[frac_mask] = (as_num.loc[frac_mask] * 86400).round().astype(int)
         df["Duración (seg)"] = dur
     elif "dur" in df.columns:
-        dur = df["dur"].apply(_parse_duration_to_seconds)
-        df["Duración (seg)"] = dur
+        df["Duración (seg)"] = df["dur"].apply(_parse_duration_to_seconds)
     else:
         df["Duración (seg)"] = None
 
-    # IDs
+    # Identificadores
     df["IMEI"] = df.get("imei")
     df["IMSI"] = df.get("imsi")
 
-    # Radio / celda
+    # Celda / Radio
     df["LAC_TAC"] = df.get("lac_tac")
     df["CI_ECI"] = df.get("ci_eci")
     df["Tecnología"] = df.get("tecnologia")
@@ -255,7 +226,6 @@ def _strict_att_normalize(raw_df: pd.DataFrame, tz: Optional[str]) -> pd.DataFra
             df["PLUS_CODE"] = None
     else:
         df["PLUS_CODE"] = df.get("plus_code")
-
     df["PLUS_CODE_NOMBRE"] = df.get("plus_code_nombre") if "plus_code_nombre" in df.columns else df.get("direccion")
 
     # Registro_ID
@@ -274,8 +244,7 @@ def _strict_att_normalize(raw_df: pd.DataFrame, tz: Optional[str]) -> pd.DataFra
     ]
     for c in cols_final:
         if c not in df.columns: df[c] = None
-    df = df[cols_final]
-    return df
+    return df[cols_final]
 
 # ==================== Pipeline completo ====================
 
@@ -364,10 +333,66 @@ def build_excel(df: pd.DataFrame, log: pd.DataFrame, dupes: pd.DataFrame, stats:
     bio.seek(0)
     return bio.getvalue()
 
+# ==================== Helpers UI ====================
+
+CSV_SEPS = [",", ";", "\t", "|"]
+CSV_ENCS = ["utf-8", "latin1"]
+
+def sniff_headers_from_bytes(buf: bytes, filename: str) -> Optional[List[str]]:
+    """Devuelve encabezados detectados del archivo en memoria."""
+    name = filename.lower()
+    try:
+        if name.endswith((".xlsx", ".xls", ".xlsm")):
+            xls = pd.ExcelFile(io.BytesIO(buf))
+            sheet = xls.sheet_names[0]
+            df = pd.read_excel(io.BytesIO(buf), sheet_name=sheet, nrows=5)
+            return list(map(str, df.columns))
+        elif name.endswith((".csv", ".txt")):
+            for enc in CSV_ENCS:
+                for sep in CSV_SEPS:
+                    try:
+                        df = pd.read_csv(io.BytesIO(buf), engine="python", encoding=enc, sep=sep, nrows=5)
+                        return list(map(str, df.columns))
+                    except Exception:
+                        continue
+            df = pd.read_csv(io.BytesIO(buf), engine="python", nrows=5)
+            return list(map(str, df.columns))
+    except Exception:
+        return None
+    return None
+
+def rename_with_manual_map(src_path: str, dst_path: str, mapping: Dict[str, Optional[str]]) -> None:
+    """Lee el archivo, renombra columnas (raw->canónicas) y escribe CSV UTF-8 con coma."""
+    ext = os.path.splitext(src_path)[1].lower()
+    if ext in {".xls", ".xlsx", ".xlsm"}:
+        df = pd.read_excel(src_path)
+    elif ext in {".csv", ".txt"}:
+        ok = False
+        for enc in CSV_ENCS:
+            for sep in CSV_SEPS:
+                try:
+                    df = pd.read_csv(src_path, engine="python", encoding=enc, sep=sep)
+                    ok = True; break
+                except Exception:
+                    continue
+            if ok: break
+        if not ok:
+            df = pd.read_csv(src_path, engine="python", encoding_errors="ignore")
+    else:
+        df = pd.read_csv(src_path, engine="python", encoding_errors="ignore")
+
+    rename_map = {}
+    for canonical, raw_name in mapping.items():
+        if raw_name and raw_name in df.columns:
+            rename_map[raw_name] = canonical
+    if rename_map:
+        df = df.rename(columns=rename_map)
+    df.to_csv(dst_path, index=False, encoding="utf-8")
+
 # ==================== UI ====================
 
 st.title("📞 Go Mapper — Compilador AT&T (single-file)")
-st.caption("Ruta rápida con mapeo **estricto AT&T** y tolerante a Excel (FECHA/HORA numéricas, HH:MM:SS, DUR en segundos o HH:MM:SS).")
+st.caption("Modo **estricto AT&T** compatible con seriales Excel en FECHA/HORA y DUR en segundos o HH:MM:SS.")
 
 st.sidebar.header("Parámetros")
 tz = st.sidebar.text_input("Zona horaria", value="America/Mazatlan")
@@ -379,15 +404,47 @@ files = st.file_uploader(
     accept_multiple_files=True,
 )
 
+# Asistente de mapeo manual (opcional)
+manual_map: Dict[str, Optional[str]] = {}
+use_manual = False
+
+if files:
+    first = files[0]
+    headers = sniff_headers_from_bytes(first.getvalue(), first.name) or []
+    with st.expander("🧭 Asistente de mapeo (opcional)", expanded=True):
+        st.caption("Si AT&T cambió encabezados, asigna aquí. Se aplicará a todos los archivos antes de compilar.")
+        cols = [None] + headers
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            a   = st.selectbox("Número A (MSISDN origen)", options=cols, index=0, key="map_a")
+            dtc = st.selectbox("FechaHora combinada", options=cols, index=0, key="map_datetime")
+            rid = st.selectbox("Registro_ID (NO)", options=cols, index=0, key="map_rid")
+        with c2:
+            b   = st.selectbox("Número B (MSISDN destino)", options=cols, index=0, key="map_b")
+            f   = st.selectbox("Fecha (si viene separada)", options=cols, index=0, key="map_fecha")
+            dur = st.selectbox("Duración (seg o HH:MM:SS)", options=cols, index=0, key="map_dur")
+        with c3:
+            t   = st.selectbox("Tipo (voz/datos/sms)", options=cols, index=0, key="map_tipo")
+            h   = st.selectbox("Hora (si viene separada)", options=cols, index=0, key="map_hora")
+            imei= st.selectbox("IMEI (opcional)", options=cols, index=0, key="map_imei")
+
+        use_manual = st.checkbox("Usar este mapeo manual en la compilación", value=False)
+        if use_manual:
+            manual_map = {
+                "numero_a": a, "numero_b": b, "tipo": t, "datetime": dtc,
+                "fecha": f, "hora": h, "duracion_seg": dur, "registro_id": rid, "imei": imei,
+            }
+            pretty = {k: v for k, v in manual_map.items() if v}
+            if pretty: st.success(f"Mapeo manual activo: {pretty}")
+            else:      st.info("Mapeo manual activado sin asignaciones — se usarán heurísticas del motor estricto.")
+
 left, right = st.columns(2)
-go = left.button("🧩 Compilar (modo estricto AT&T)", type="primary")
+go    = left.button("🧩 Compilar (modo estricto AT&T)", type="primary")
 clear = right.button("🗑️ Limpiar sesión")
 
 if clear:
-    try:
-        st.rerun()
-    except Exception:
-        st.experimental_rerun()
+    try: st.rerun()
+    except Exception: st.experimental_rerun()
 
 if go:
     if not files:
@@ -398,15 +455,23 @@ if go:
             with tempfile.TemporaryDirectory() as tmpdir:
                 for f in files:
                     suffix = ("." + f.name.split(".")[-1].lower()) if "." in f.name else ""
-                    p = tempfile.NamedTemporaryFile(delete=False, dir=tmpdir, suffix=suffix).name
-                    with open(p, "wb") as w:
+                    raw_path = tempfile.NamedTemporaryFile(delete=False, dir=tmpdir, suffix=suffix).name
+                    with open(raw_path, "wb") as w:
                         w.write(f.getvalue())
-                    tmp_paths.append(p)
+
+                    # Si eligieron mapeo manual: renombramos antes a canónico en CSV intermedio
+                    if use_manual and any(manual_map.values()):
+                        norm_path = tempfile.NamedTemporaryFile(delete=False, dir=tmpdir, suffix=".csv").name
+                        rename_with_manual_map(raw_path, norm_path, manual_map)
+                        tmp_paths.append(norm_path)
+                    else:
+                        tmp_paths.append(raw_path)
 
                 with st.spinner("Compilando y normalizando (estricto AT&T)…"):
                     res = compile_att_sabanas_strict(tmp_paths, tz=tz)
 
                 st.success(f"✅ Compilado: {len(res.df):,} filas | Archivos: {len(files)}")
+
                 if show_preview:
                     st.subheader("Preview — Datos_Limpios")
                     st.dataframe(res.df.head(500), width="stretch")
@@ -420,6 +485,7 @@ if go:
                         st.markdown(f"**{k}**")
                         st.dataframe(v, width="stretch")
 
+                # Descargar Excel
                 xlsx = build_excel(res.df, res.log, res.dupes, res.stats)
                 st.download_button(
                     "⬇️ Descargar Excel Compilado",
@@ -434,8 +500,9 @@ if go:
 st.markdown("""
 ---
 **Notas**
-- Encabezados esperados por el modo estricto (insensible a may/minúsculas y acentos):  
+- Encabezados esperados (insensible a mayúsculas/acentos):  
 `NO, SERV, T_REG, NUM_A, NUM_A_IMSI, NUM_A_IMEI, DEST, ID_DEST, HUSO, FECHA, HORA, DUR, USO_DW, USO_UP, ID_CELDA, LATITUD, LONGITUD, AZIMUTH, CAUSA_T, TIPO_COM, PAIS`.
-- FECHA/HORA: acepta serial de Excel (número) o texto `dd/mm/aaaa` y `HH:MM(:SS)`.  
-- DUR: acepta segundos, fracción de día Excel (<1) o `HH:MM:SS`.
+- FECHA/HORA: acepta serial de Excel (número) o texto (`dd/mm/aaaa` y `HH:MM(:SS)`).  
+- DUR: acepta segundos, fracción de día Excel (<1) o `HH:MM:SS`.  
+- Dedupe especial *DATOS/min*: conserva el registro de mayor duración por par A/B por minuto.
 """)
