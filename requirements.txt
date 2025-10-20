@@ -1,0 +1,5 @@
+streamlit>=1.37
+pandas>=2.1
+numpy>=1.26
+xlsxwriter>=3.2
+openlocationcode>=1.0 ; python_version >= "3.8"
