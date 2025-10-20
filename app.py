@@ -1,4 +1,3 @@
-# app.py — Go Mapper — Compilador AT&T (una sola página)
 import streamlit as st
 import pandas as pd
 import io
@@ -13,7 +12,6 @@ st.write(
     "y descarga un Excel con *Datos_Limpios*, *LOG_Compilación*, *Duplicados* y hojas de estadísticas."
 )
 
-# Import del módulo
 try:
     from modules.att_compiler import compile_att_sabanas
 except Exception as e:
@@ -21,7 +19,6 @@ except Exception as e:
     st.exception(e)
     st.stop()
 
-# Sidebar
 st.sidebar.header("Parámetros")
 tz = st.sidebar.text_input("Zona horaria", value="America/Mazatlan")
 show_preview = st.sidebar.checkbox("Mostrar preview de datos", value=True)
@@ -32,12 +29,12 @@ st.sidebar.caption(
     "Latitud/Longitud y tienes `openlocationcode` instalado."
 )
 
-# Carga de archivos
 files = st.file_uploader(
     "Arrastra y suelta archivos de AT&T (puedes subir varios)",
     type=["xlsx", "xls", "csv", "txt"],
     accept_multiple_files=True,
 )
+
 left, right = st.columns([1,1])
 compile_clicked = left.button("🧩 Compilar sábanas AT&T", type="primary")
 clear_clicked = right.button("🗑️ Limpiar sesión")
@@ -64,12 +61,10 @@ if compile_clicked:
 
             st.success(f"✅ Compilado: {len(res.df):,} filas | Archivos procesados: {len(files)}")
 
-            # Preview
             if show_preview:
                 st.subheader("Preview — Datos_Limpios")
-                st.dataframe(res.df.head(500), width="stretch")  # evita aviso deprecado
+                st.dataframe(res.df.head(500), width="stretch")
 
-            # Resumen rápido
             st.subheader("Resumen rápido")
             c1, c2, c3 = st.columns(3)
             with c1:
@@ -85,11 +80,9 @@ if compile_clicked:
                 st.write("**Duplicados (DATOS/min) removidos**")
                 st.metric("Filas duplicadas", f"{len(res.dupes):,}")
 
-            # LOG
             with st.expander("📜 LOG de compilación"):
                 st.dataframe(res.log, width="stretch")
 
-            # Estadísticas
             if res.stats:
                 st.subheader("📊 ESTADÍSTICAS")
                 for name, sdf in res.stats.items():
@@ -98,7 +91,6 @@ if compile_clicked:
             else:
                 st.caption("No se generaron estadísticas (dataset vacío o columnas clave ausentes).")
 
-            # Descargar Excel
             def build_excel_bytes(df: pd.DataFrame, log: pd.DataFrame, dupes: pd.DataFrame, stats: Dict[str, pd.DataFrame]) -> bytes:
                 bio = io.BytesIO()
                 with pd.ExcelWriter(bio, engine="xlsxwriter") as xw:
