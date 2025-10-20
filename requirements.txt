@@ -2,6 +2,6 @@ streamlit>=1.37
 pandas>=2.1
 numpy>=1.26
 xlsxwriter>=3.2
-openpyxl>=3.1          # .xlsx
-xlrd==1.2.0            # .xls (soporta BIFF; la 2.x ya no soporta .xls)
-openlocationcode>=1.0  # opcional (PLUS_CODE)
+openpyxl>=3.1
+xlrd==1.2.0
+openlocationcode>=1.0
