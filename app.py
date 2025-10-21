@@ -1,7 +1,12 @@
-# app.py — AT&T → Limpieza (20 cols) + Estadísticos + Geocoding HTTP (sin geopy) — v3.4
+# app.py — AT&T → Limpieza (20 cols) + Estadísticos + Geocoding HTTP + Repositorio de Antenas (SQLite)
+# v3.5 — Single-file listo para Streamlit Cloud
+# - Reemplaza la caché en memoria por un REPOSITORIO PERSISTENTE (SQLite) de ubicaciones de antenas
+# - Misma interfaz y Excel que la app de Limpieza
+# - Sin dependencia de geopy
 
 from __future__ import annotations
-import io, os, re, time, tempfile, unicodedata
+import io, os, re, sqlite3, tempfile, unicodedata
+from datetime import datetime
 from functools import lru_cache
 from typing import Any, List, Dict, Tuple, Optional
 
@@ -30,25 +35,34 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("📞 Go Mapper — Compilador AT&T (igual a Limpieza)")
-st.write("Convierte sábanas de AT&T al formato **Datos_Limpios (20 columnas)**, genera **PLUS_CODE** y **dirección** (vía HTTP), "
-         "calcula **estadísticos** y exporta un Excel como en la app de Limpieza.")
+st.title("📞 Go Mapper — Compilador AT&T (Limpieza + Repositorio de Antenas)")
+st.write(
+    "Convierte sábanas de AT&T al formato **Datos_Limpios (20 columnas)**, genera **PLUS_CODE** y **dirección**, "
+    "calcula **estadísticos**, y mantiene un **repositorio propio** de ubicaciones de antenas en SQLite."
+)
 
 # ===========================
 # PARÁMETROS UI
 # ===========================
 st.sidebar.header("Parámetros")
 telefono_fijo = st.sidebar.text_input("Fijar columna 'Teléfono' (opcional)", value="", help="Si lo dejas vacío se usará NUM_A.")
-remove_dups = st.sidebar.checkbox(
-    "Eliminar duplicados de DATOS por minuto (A/B), conservar la mayor duración",
-    value=False
-)
-enable_geocode = st.sidebar.checkbox("Geocoding HTTP (Nominatim/BigDataCloud/Keys opcionales)", value=True)
+remove_dups = st.sidebar.checkbox("Eliminar duplicados de DATOS por minuto (A/B), conservar la mayor duración", value=False)
 show_preview = st.sidebar.checkbox("Mostrar preview", value=True)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Repositorio de Antenas (persistente)")
+DB_PATH = st.sidebar.text_input("Ruta del repositorio (SQLite)", value="antenas_repo.sqlite", help="Se crea automáticamente si no existe.")
+PRECISION = st.sidebar.number_input("Precisión (decimales) para agrupar coords", min_value=0, max_value=7, value=6, step=1)
+use_repo = st.sidebar.checkbox("Usar repositorio para resolver nombres antes de geocodificar", value=True)
+update_repo = st.sidebar.checkbox("Actualizar repositorio con nuevas resoluciones", value=True)
+
+st.sidebar.caption("Exporta un respaldo y/o importa tus curados.")
+repo_export_btn = st.sidebar.button("⬇️ Exportar repositorio (CSV)")
+repo_import_file = st.sidebar.file_uploader("⬆️ Importar/merge CSV al repositorio", type=["csv"]) 
 
 # Geocoding HTTP: configuración básica
 CONTACT_EMAIL = os.getenv("CONTACT_EMAIL", "contacto@example.com")
-APP_VER       = "att-limpieza/3.4"
+APP_VER       = "att-limpieza/3.5"
 USER_AGENT    = f"{APP_VER} (+{CONTACT_EMAIL})"
 
 NOMINATIM_URL = os.getenv("NOMINATIM_URL", "https://nominatim.openstreetmap.org").rstrip("/")
@@ -57,7 +71,7 @@ LOCATIONIQ_KEY = os.getenv("LOCATIONIQ_API_KEY") or st.secrets.get("LOCATIONIQ_A
 
 GEOCODER_TIMEOUT      = 20
 MAX_UNIQUE_GEOCODES   = 800
-COORD_PRECISION_CACHE = 6
+COORD_PRECISION_CACHE = 6  # precisión para cache local de funciones
 
 # ===========================
 # PROGRESO
@@ -141,6 +155,7 @@ def dms_to_decimal(value):
 # HEADER SNIFF AT&T
 # ===========================
 REQ = {"NO","FECHA"}; ANY = {"DUR","DURACIÓN"}
+
 def looks_like_header(vals: List[Any]) -> bool:
     up = {str(x).strip().upper() for x in vals if pd.notna(x)}
     return REQ.issubset(up) and len(ANY.intersection(up)) > 0
@@ -267,9 +282,98 @@ def dedupe_datos_by_minute(df: pd.DataFrame):
     return out, duplicados_df, len(duplicados_df)
 
 # ===========================
-# GEOCODING HTTP (sin geopy) + caché en memoria
+# REPOSITORIO DE ANTENAS (SQLite)
 # ===========================
-def _reverse_nominatim(lat, lon, lang="es") -> str:
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS antenas_repo (
+  lat REAL NOT NULL,
+  lon REAL NOT NULL,
+  lat_round REAL NOT NULL,
+  lon_round REAL NOT NULL,
+  precision INTEGER NOT NULL,
+  plus_code TEXT,
+  nombre TEXT,
+  fuente TEXT,
+  confianza INTEGER,
+  primera_vez TEXT,
+  ultima_vez TEXT,
+  veces INTEGER DEFAULT 1,
+  PRIMARY KEY (lat_round, lon_round, precision)
+);
+"""
+
+def repo_connect(path: str):
+    con = sqlite3.connect(path)
+    con.execute("PRAGMA journal_mode=WAL;")
+    con.execute(SCHEMA)
+    con.commit()
+    return con
+
+def repo_fetch_map(con: sqlite3.Connection, precision: int) -> Dict[Tuple[float,float], Dict[str, Any]]:
+    rows = con.execute(
+        "SELECT lat_round, lon_round, nombre, plus_code, fuente, confianza, veces FROM antenas_repo WHERE precision=?",
+        (precision,)
+    ).fetchall()
+    m: Dict[Tuple[float,float], Dict[str, Any]] = {}
+    for r in rows:
+        m[(float(r[0]), float(r[1]))] = {
+            "nombre": r[2] or "",
+            "plus_code": r[3] or "",
+            "fuente": r[4] or "",
+            "confianza": r[5] if r[5] is not None else None,
+            "veces": r[6] if r[6] is not None else 0,
+        }
+    return m
+
+def repo_upsert_many(con: sqlite3.Connection, items: List[Dict[str, Any]]):
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    for it in items:
+        con.execute(
+            """
+            INSERT INTO antenas_repo(lat,lon,lat_round,lon_round,precision,plus_code,nombre,fuente,confianza,primera_vez,ultima_vez,veces)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,1)
+            ON CONFLICT(lat_round,lon_round,precision) DO UPDATE SET
+              nombre=COALESCE(excluded.nombre, antenas_repo.nombre),
+              plus_code=COALESCE(excluded.plus_code, antenas_repo.plus_code),
+              fuente=COALESCE(excluded.fuente, antenas_repo.fuente),
+              confianza=COALESCE(excluded.confianza, antenas_repo.confianza),
+              ultima_vez=?,
+              veces=antenas_repo.veces+1
+            """,
+            (
+                it.get("lat"), it.get("lon"), it.get("lat_round"), it.get("lon_round"), it.get("precision"),
+                it.get("plus_code"), it.get("nombre"), it.get("fuente"), it.get("confianza"),
+                now, now, now
+            )
+        )
+    con.commit()
+
+def repo_export_df(con: sqlite3.Connection) -> pd.DataFrame:
+    return pd.read_sql_query("SELECT * FROM antenas_repo ORDER BY precision DESC, lat_round, lon_round", con)
+
+def repo_import_df(con: sqlite3.Connection, df: pd.DataFrame):
+    req_cols = {"lat","lon","lat_round","lon_round","precision","nombre"}
+    if not req_cols.issubset(set(df.columns)):
+        raise ValueError(f"CSV incompleto. Debe incluir columnas: {sorted(req_cols)}")
+    items = []
+    for _, r in df.iterrows():
+        items.append({
+            "lat": float(r["lat"]),
+            "lon": float(r["lon"]),
+            "lat_round": float(r["lat_round"]),
+            "lon_round": float(r["lon_round"]),
+            "precision": int(r["precision"]),
+            "plus_code": (str(r.get("plus_code")) if not pd.isna(r.get("plus_code")) else None),
+            "nombre": (str(r.get("nombre")) if not pd.isna(r.get("nombre")) else None),
+            "fuente": (str(r.get("fuente")) if not pd.isna(r.get("fuente")) else None),
+            "confianza": (int(r.get("confianza")) if pd.notna(r.get("confianza")) else None),
+        })
+    repo_upsert_many(con, items)
+
+# ===========================
+# GEOCODING HTTP (sin geopy)
+# ===========================
+def _reverse_nominatim(lat, lon, lang="es") -> Tuple[str,str]:
     url = f"{NOMINATIM_URL}/reverse"
     params = {
         "format": "jsonv2",
@@ -284,12 +388,11 @@ def _reverse_nominatim(lat, lon, lang="es") -> str:
     r = requests.get(url, params=params, headers=headers, timeout=GEOCODER_TIMEOUT)
     r.raise_for_status()
     data = r.json()
-    if isinstance(data, dict):
-        return data.get("display_name") or ""
-    return ""
+    txt = data.get("display_name") if isinstance(data, dict) else ""
+    return (txt or "", "nominatim")
 
-def _reverse_locationiq(lat, lon, lang="es") -> str:
-    if not LOCATIONIQ_KEY: return ""
+def _reverse_locationiq(lat, lon, lang="es") -> Tuple[str,str]:
+    if not LOCATIONIQ_KEY: return ("", "locationiq")
     url = "https://us1.locationiq.com/v1/reverse"
     params = {
         "key": LOCATIONIQ_KEY,
@@ -303,10 +406,11 @@ def _reverse_locationiq(lat, lon, lang="es") -> str:
     r = requests.get(url, params=params, timeout=GEOCODER_TIMEOUT)
     r.raise_for_status()
     js = r.json()
-    return (js.get("display_name") or "") if isinstance(js, dict) else ""
+    txt = (js.get("display_name") or "") if isinstance(js, dict) else ""
+    return (txt, "locationiq")
 
-def _reverse_opencage(lat, lon, lang="es") -> str:
-    if not OPENCAGE_KEY: return ""
+def _reverse_opencage(lat, lon, lang="es") -> Tuple[str,str]:
+    if not OPENCAGE_KEY: return ("", "opencage")
     url = "https://api.opencagedata.com/geocode/v1/json"
     params = {
         "q": f"{float(lat):.6f},{float(lon):.6f}",
@@ -318,11 +422,10 @@ def _reverse_opencage(lat, lon, lang="es") -> str:
     r = requests.get(url, params=params, timeout=GEOCODER_TIMEOUT)
     r.raise_for_status()
     js = r.json()
-    if isinstance(js, dict) and js.get("results"):
-        return js["results"][0].get("formatted", "") or ""
-    return ""
+    txt = js["results"][0].get("formatted", "") if (isinstance(js, dict) and js.get("results")) else ""
+    return (txt, "opencage")
 
-def _reverse_bigdatacloud(lat, lon, lang="es") -> str:
+def _reverse_bigdatacloud(lat, lon, lang="es") -> Tuple[str,str]:
     url = "https://api.bigdatacloud.net/data/reverse-geocode-client"
     params = {
         "latitude": float(lat),
@@ -332,68 +435,67 @@ def _reverse_bigdatacloud(lat, lon, lang="es") -> str:
     r = requests.get(url, params=params, timeout=GEOCODER_TIMEOUT)
     r.raise_for_status()
     js = r.json()
-    if not isinstance(js, dict): return ""
-    parts = [
-        js.get("locality") or js.get("city"),
-        js.get("principalSubdivision"),
-        js.get("countryName"),
-    ]
+    if not isinstance(js, dict):
+        return ("", "bigdatacloud")
+    parts = [ js.get("locality") or js.get("city"), js.get("principalSubdivision"), js.get("countryName") ]
     out = ", ".join([p for p in parts if p])
-    return out or ""
+    return (out or "", "bigdatacloud")
 
 @lru_cache(maxsize=10000)
-def reverse_best_cached(lat_round, lon_round, lang="es") -> str:
-    # Orden: Nominatim → LocationIQ (si key) → OpenCage (si key) → BigDataCloud
+def reverse_best_cached(lat_round, lon_round, lang="es") -> Tuple[str,str]:
     for L in [lang, "es", "es-mx", "en"]:
         for fn in (_reverse_nominatim, _reverse_locationiq, _reverse_opencage, _reverse_bigdatacloud):
             try:
-                txt = fn(lat_round, lon_round, L)
-                if txt: return txt
+                txt, src = fn(lat_round, lon_round, L)
+                if txt:
+                    return (txt, src)
             except Exception:
                 continue
-    return ""
+    return ("", "")
 
-def reverse_address(lat, lon, lang="es", precision=COORD_PRECISION_CACHE) -> str:
-    return reverse_best_cached(round(float(lat), precision), round(float(lon), precision), lang)
+def reverse_address_with_source(lat, lon, lang="es", precision=COORD_PRECISION_CACHE) -> Tuple[str,str]:
+    lt = round(float(lat), precision); ln = round(float(lon), precision)
+    return reverse_best_cached(lt, ln, lang)
 
 # ===========================
-# ESTADÍSTICOS (como Limpieza)
+# ESTADÍSTICOS (dtype-safe)
 # ===========================
-def _clean_number(x: str) -> str:
-    if x is None or (isinstance(x, float) and pd.isna(x)):
-        return ""
-    return re.sub(r"\D+", "", str(x))
-
 def build_statistics_blocks(df: pd.DataFrame) -> List[Tuple[str, pd.DataFrame]]:
     blocks: List[Tuple[str, pd.DataFrame]] = []
-    if df.empty:
+    if df is None or df.empty:
         return blocks
 
-    # Excluir duplicados marcados
+    df = df.copy()
     if "Es_Duplicado" in df.columns:
         df = df[~df["Es_Duplicado"].fillna(False)].copy()
 
-    tel_col = "Teléfono" if "Teléfono" in df.columns else None
-    numA, numB = df.get("Número A"), df.get("Número B")
-    tipo = df.get("Tipo")
+    df["Tipo"] = df.get("Tipo").astype("string")
+    df["Datetime"] = pd.to_datetime(df.get("Datetime"), errors="coerce")
+
+    numA = df.get("Número A")
+    numB = df.get("Número B")
     dur  = pd.to_numeric(df.get("Duración (seg)"), errors="coerce") if "Duración (seg)" in df.columns else pd.Series(dtype=float)
-    dt   = pd.to_datetime(df.get("Datetime"), errors="coerce")
+
+    def _clean_number(x: Any) -> str:
+        if x is None or (isinstance(x, float) and pd.isna(x)): return ""
+        return re.sub(r"\D+", "", str(x))
 
     tel = ""
-    if tel_col:
-        tel_clean_series = df[tel_col].map(_clean_number)
-        tel = tel_clean_series.mode().iloc[0] if not tel_clean_series.dropna().empty else ""
+    if "Teléfono" in df.columns:
+        tel_mode = df["Teléfono"].map(_clean_number)
+        tel = tel_mode.mode().iloc[0] if not tel_mode.dropna().empty else ""
 
     A_clean = numA.map(_clean_number) if numA is not None else pd.Series([""]*len(df))
     B_clean = numB.map(_clean_number) if numB is not None else pd.Series([""]*len(df))
-    is_voice = tipo.astype(str).str.contains("VOZ", case=False, na=False) if tipo is not None else pd.Series([False]*len(df))
+    is_voice = df["Tipo"].astype(str).str.contains("VOZ", case=False, na=False)
 
-    dt_valid = dt.dropna().sort_values() if isinstance(dt, pd.Series) else pd.Series(dtype="datetime64[ns]")
+    dt_valid = df["Datetime"].dropna().sort_values()
     rango_ini = dt_valid.min() if not dt_valid.empty else pd.NaT
     rango_fin = dt_valid.max() if not dt_valid.empty else pd.NaT
     dias_act  = dt_valid.dt.date.nunique() if not dt_valid.empty else 0
     max_gap_h = (dt_valid.diff().max().total_seconds()/3600) if (len(dt_valid) >= 2) else 0
-    counts_by_tipo = tipo.value_counts().to_dict() if tipo is not None else {}
+
+    counts_by_tipo = df["Tipo"].value_counts(dropna=False).to_dict()
     voz_dur = dur[is_voice] if not dur.empty else pd.Series(dtype=float)
 
     resumen_rows = [
@@ -404,7 +506,8 @@ def build_statistics_blocks(df: pd.DataFrame) -> List[Tuple[str, pd.DataFrame]]:
         ["Máximo periodo de inactividad (h)", round(max_gap_h, 2)],
         ["Eventos totales", len(df)],
     ]
-    for k, v in counts_by_tipo.items(): resumen_rows.append([f"Total {k}", int(v)])
+    for k, v in counts_by_tipo.items():
+        resumen_rows.append([f"Total {k}", int(v)])
     if not voz_dur.empty:
         resumen_rows += [
             ["Duración VOZ total (s)", int(voz_dur.sum())],
@@ -425,7 +528,6 @@ def build_statistics_blocks(df: pd.DataFrame) -> List[Tuple[str, pd.DataFrame]]:
         dir_rows.append([nombre, n, dsum, dmean])
     blocks.append(("2) Dirección del tráfico (VOZ)", pd.DataFrame(dir_rows, columns=["Dirección","# Llamadas","Duración total (s)","Duración media (s)"])))
 
-    # Top 10 salientes
     if numB is not None:
         sal = pd.DataFrame(df[out_mask])
         if not sal.empty:
@@ -442,7 +544,6 @@ def build_statistics_blocks(df: pd.DataFrame) -> List[Tuple[str, pd.DataFrame]]:
         else:
             blocks.append(("3) Top 10 contactos SALIENTES", pd.DataFrame(columns=["Número","Llamadas","Duración_total_s","Primera","Última"])))
 
-    # Top 10 entrantes
     if numA is not None:
         ent = pd.DataFrame(df[in_mask])
         if not ent.empty:
@@ -453,30 +554,34 @@ def build_statistics_blocks(df: pd.DataFrame) -> List[Tuple[str, pd.DataFrame]]:
                             Duración_total_s=("Duración (seg)","sum"),
                             Primera=("Datetime","min"),
                             Última=("Datetime","max"))
-                       .reset_index().rename(columns={"Contraparte":"Número"}))
+                       ).reset_index().rename(columns={"Contraparte":"Número"})
             top_ent = top_ent.sort_values(["Llamadas","Duración_total_s"], ascending=[False,False]).head(10)
             blocks.append(("4) Top 10 contactos ENTRANTES", top_ent))
         else:
             blocks.append(("4) Top 10 contactos ENTRANTES", pd.DataFrame(columns=["Número","Llamadas","Duración_total_s","Primera","Última"])))
 
-    # Antenas TOP por tipo
     if "PLUS_CODE_NOMBRE" in df.columns and df["PLUS_CODE_NOMBRE"].notna().any():
-        antena_series = df["PLUS_CODE_NOMBRE"].fillna("")
-    elif {"Latitud","Longitud"}.issubset(df.columns):
-        antena_series = (df["Latitud"].round(6).astype(str) + "," + df["Longitud"].round(6).astype(str))
+        antena_series = df["PLUS_CODE_NOMBRE"].astype(str).fillna("")
     else:
-        antena_series = pd.Series([""]*len(df))
+        lat = pd.to_numeric(df.get("Latitud"), errors="coerce") if "Latitud" in df.columns else pd.Series(index=df.index, dtype="float64")
+        lon = pd.to_numeric(df.get("Longitud"), errors="coerce") if "Longitud" in df.columns else pd.Series(index=df.index, dtype="float64")
+        antena_series = pd.Series("", index=df.index, dtype="object")
+        mask_ok = lat.notna() & lon.notna()
+        if mask_ok.any():
+            antena_series.loc[mask_ok] = lat[mask_ok].round(6).astype(str) + "," + lon[mask_ok].round(6).astype(str)
 
     tipos_orden = ["DATOS", "VOZ ENTRANTE", "VOZ SALIENTE", "MENSAJES 2 VÍAS", "TRANSFER"]
     letras = ["A","B","C","D","E"]; idx = 0
     tipo_norm = df["Tipo"].astype(str).str.upper()
-    dt = pd.to_datetime(df.get("Datetime"), errors="coerce")
+
     for tnombre in tipos_orden:
         mask_t = tipo_norm.eq(tnombre)
-        if not mask_t.any(): continue
-        tmp = pd.DataFrame({"Antena": antena_series[mask_t], "Datetime": dt[mask_t]})
+        if not mask_t.any():
+            continue
+        tmp = pd.DataFrame({"Antena": antena_series[mask_t], "Datetime": df["Datetime"][mask_t]})
         tmp = tmp[tmp["Antena"].astype(str).str.len() > 0]
-        if tmp.empty: continue
+        if tmp.empty:
+            continue
         top_ant_t = (tmp.groupby("Antena")
                      .agg(Eventos=("Antena","count"),
                           Primera=("Datetime","min"),
@@ -484,7 +589,6 @@ def build_statistics_blocks(df: pd.DataFrame) -> List[Tuple[str, pd.DataFrame]]:
                      ).reset_index().sort_values("Eventos", ascending=False).head(5)
         blocks.append((f"5{letras[idx]}) Antenas TOP — {tnombre}", top_ant_t)); idx += 1
 
-    # IMEI
     if "IMEI" in df.columns:
         imei_df = df.copy()
         imei_df["IMEI"] = imei_df["IMEI"].astype(str)
@@ -523,6 +627,29 @@ if clear:
 # ===========================
 # MAIN
 # ===========================
+if repo_export_btn:
+    try:
+        con = repo_connect(DB_PATH)
+        df_repo = repo_export_df(con)
+        con.close()
+        csv_bytes = df_repo.to_csv(index=False).encode("utf-8")
+        st.download_button("Descargar antenas_repo.csv", data=csv_bytes, file_name="antenas_repo.csv", mime="text/csv")
+        st.success(f"Exportadas {len(df_repo):,} filas del repositorio.")
+    except Exception as e:
+        st.error("No se pudo exportar el repositorio.")
+        st.exception(e)
+
+if repo_import_file is not None:
+    try:
+        con = repo_connect(DB_PATH)
+        df_imp = pd.read_csv(repo_import_file)
+        repo_import_df(con, df_imp)
+        con.close()
+        st.success(f"Importadas/actualizadas {len(df_imp):,} filas al repositorio.")
+    except Exception as e:
+        st.error("No se pudo importar el CSV al repositorio.")
+        st.exception(e)
+
 if go:
     if not uploaded_files:
         st.warning("Primero sube al menos un archivo.")
@@ -573,37 +700,98 @@ if go:
                     lambda x: plus_code(x["Latitud"], x["Longitud"]), axis=1
                 )
 
-            # Geocoding HTTP opcional
-            progress_section(progress, 62, "🌍 Geocodificando direcciones (HTTP)…")
-            if enable_geocode and mask_coords.any():
-                # caché simple en memoria de la sesión
-                if "geo_cache" not in st.session_state:
-                    st.session_state.geo_cache = {}
-                cache: Dict[Tuple[float,float], str] = st.session_state.geo_cache
-
+            # ===== Resolver nombres con REPOSITORIO, luego geocodar lo faltante y actualizar repo =====
+            progress_section(progress, 62, "📚 Resolviendo nombres de antenas…")
+            if mask_coords.any():
                 coords_unique = limpio.loc[mask_coords, ["Latitud","Longitud"]].drop_duplicates().reset_index(drop=True)
-                keys = [(round(float(r["Latitud"]), COORD_PRECISION_CACHE),
-                         round(float(r["Longitud"]), COORD_PRECISION_CACHE)) for _, r in coords_unique.iterrows()]
-                missing = [k for k in keys if k not in cache]
-                to_resolve = missing[:MAX_UNIQUE_GEOCODES]
+                coords_unique["lat_round"] = coords_unique["Latitud"].round(PRECISION)
+                coords_unique["lon_round"] = coords_unique["Longitud"].round(PRECISION)
 
-                for idx, (lt, ln) in enumerate(to_resolve, 1):
-                    addr = (reverse_address(lt, ln, lang="es")
-                            or reverse_address(lt, ln, lang="es-mx")
-                            or reverse_address(lt, ln, lang="en")
-                            or "SIN_DIRECCIÓN")
-                    cache[(lt, ln)] = addr
+                resolved_map: Dict[Tuple[float,float], str] = {}
+                plus_local: Dict[Tuple[float,float], str] = {}
+                to_resolve: List[Tuple[float,float,float,float]] = []  # (lat,lon,lat_r,lon_r)
+
+                if use_repo:
+                    try:
+                        con = repo_connect(DB_PATH)
+                        repomap = repo_fetch_map(con, precision=PRECISION)
+                        con.close()
+                        for _, r in coords_unique.iterrows():
+                            key = (float(r["lat_round"]), float(r["lon_round"]))
+                            if key in repomap and repomap[key].get("nombre"):
+                                resolved_map[key] = repomap[key]["nombre"]
+                                if repomap[key].get("plus_code"): plus_local[key] = repomap[key]["plus_code"]
+                            else:
+                                to_resolve.append((float(r["Latitud"]), float(r["Longitud"]), key[0], key[1]))
+                    except Exception as e:
+                        st.warning(f"No se pudo abrir el repositorio: {e}")
+                        for _, r in coords_unique.iterrows():
+                            key = (float(r["lat_round"]), float(r["lon_round"]))
+                            to_resolve.append((float(r["Latitud"]), float(r["Longitud"]), key[0], key[1]))
+                else:
+                    for _, r in coords_unique.iterrows():
+                        key = (float(r["lat_round"]), float(r["lon_round"]))
+                        to_resolve.append((float(r["Latitud"]), float(r["Longitud"]), key[0], key[1]))
+
+                # Geocodar faltantes (con límite)
+                geocoded_items: List[Dict[str, Any]] = []
+                for idx, (lt, ln, ltr, lnr) in enumerate(to_resolve[:MAX_UNIQUE_GEOCODES], 1):
+                    name, fuente = reverse_address_with_source(lt, ln, lang="es", precision=COORD_PRECISION_CACHE)
+                    if not name:
+                        name, fuente = reverse_address_with_source(lt, ln, lang="es-mx", precision=COORD_PRECISION_CACHE)
+                    if not name:
+                        name, fuente = reverse_address_with_source(lt, ln, lang="en", precision=COORD_PRECISION_CACHE)
+                    if not name:
+                        name, fuente = ("SIN_DIRECCIÓN", "")
+                    key = (ltr, lnr)
+                    resolved_map[key] = name
+                    pcode = plus_code(lt, ln) if HAS_OLC else None
+                    if pcode: plus_local[key] = pcode
+
+                    if update_repo:
+                        conf = {"nominatim":70, "locationiq":80, "opencage":85, "bigdatacloud":60}.get(fuente, None)
+                        geocoded_items.append({
+                            "lat": lt,
+                            "lon": ln,
+                            "lat_round": ltr,
+                            "lon_round": lnr,
+                            "precision": PRECISION,
+                            "plus_code": pcode,
+                            "nombre": name if name and name != "SIN_DIRECCIÓN" else None,
+                            "fuente": fuente or None,
+                            "confianza": conf,
+                        })
                     pct = 62 + int(idx / max(len(to_resolve), 1) * (86 - 62))
-                    progress_section(progress, pct, f"🌍 {idx}/{len(to_resolve)} coordenadas geocodificadas")
+                    progress_section(progress, pct, f"🌍 {idx}/{len(to_resolve)} coordenadas resueltas")
 
+                if update_repo and geocoded_items:
+                    try:
+                        con = repo_connect(DB_PATH)
+                        repo_upsert_many(con, geocoded_items)
+                        con.close()
+                        st.success(f"Repositorio actualizado con {len(geocoded_items)} nuevas coordenadas.")
+                    except Exception as e:
+                        st.warning(f"No fue posible actualizar el repositorio: {e}")
+
+                # Volcar a DataFrame final
                 def pick_name(lat, lon, curr):
-                    if pd.notna(curr) and str(curr).strip(): return curr
-                    k = (round(float(lat), COORD_PRECISION_CACHE), round(float(lon), COORD_PRECISION_CACHE))
-                    return cache.get(k, "SIN_DIRECCIÓN")
-
+                    if pd.notna(curr) and str(curr).strip():
+                        return curr
+                    ltr = round(float(lat), PRECISION); lnr = round(float(lon), PRECISION)
+                    return resolved_map.get((ltr, lnr), "SIN_DIRECCIÓN")
                 limpio.loc[mask_coords, "PLUS_CODE_NOMBRE"] = limpio.loc[mask_coords].apply(
                     lambda x: pick_name(x["Latitud"], x["Longitud"], x["PLUS_CODE_NOMBRE"]), axis=1
                 )
+                # Si faltaba PLUS_CODE y lo obtuvimos localmente
+                if HAS_OLC:
+                    def pick_plus(lat, lon, curr):
+                        if pd.notna(curr) and str(curr).strip():
+                            return curr
+                        ltr = round(float(lat), PRECISION); lnr = round(float(lon), PRECISION)
+                        return plus_local.get((ltr, lnr), None)
+                    limpio.loc[mask_coords, "PLUS_CODE"] = limpio.loc[mask_coords].apply(
+                        lambda x: pick_plus(x["Latitud"], x["Longitud"], x["PLUS_CODE"]), axis=1
+                    )
 
             # Normalizar Tipo (estética)
             progress_section(progress, 90, "📚 Normalizando Tipo…")
@@ -612,6 +800,19 @@ if go:
                    "datos":"DATOS","transfer":"TRANSFER",
                    "mensajes 2 vías":"MENSAJES 2 VÍAS","2 vías":"MENSAJES 2 VÍAS"}
             limpio["Tipo"] = limpio["Tipo"].astype(str).str.strip().str.lower().replace(rep).str.upper()
+
+            # Marcar duplicados generales por (A,B,Datetime) para info
+            subset_general = [c for c in ["Número A","Número B","Datetime"] if c in limpio.columns]
+            if subset_general:
+                dup_mask_all = limpio.duplicated(subset=subset_general, keep=False)
+                limpio["Es_Duplicado"] = dup_mask_all
+                key_col = subset_general[0]
+                try:
+                    limpio["Cuenta_GrupoDup"] = limpio.groupby(subset_general, dropna=False)[key_col].transform("size")
+                except TypeError:
+                    limpio["Cuenta_GrupoDup"] = limpio.groupby(subset_general)[key_col].transform("size")
+            else:
+                limpio["Es_Duplicado"] = False; limpio["Cuenta_GrupoDup"] = 1
 
             # Duplicados DATOS por minuto (opcional)
             progress_section(progress, 92, "🧽 Procesando duplicados (DATOS)…")
@@ -633,7 +834,7 @@ if go:
             log_df = pd.DataFrame({
                 "Archivos procesados":[len(uploaded_files)],
                 "Filas totales":[len(limpio)],
-                "Duplicados eliminados (solo DATOS)":[eliminados],
+                "Duplicados eliminados (solo DATOS) ":[eliminados],
                 "Coordenadas válidas detectadas":[coords_validas],
                 "PLUS_CODE generados":[plus_generados],
                 "PLUS_CODE_NOMBRE generados":[nombres_generados],
@@ -713,7 +914,6 @@ if go:
 
             progress_section(progress, 100, "✅ Listo")
 
-            # ========= UI =========
             st.success(f"✅ Hecho: {len(limpio):,} filas en 'Datos_Limpios' (20 columnas)")
             if show_preview:
                 st.subheader("Preview — Datos_Limpios (20 columnas)")
