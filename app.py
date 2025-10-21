@@ -1,5 +1,6 @@
-# app.py — Go Mapper — Compilador AT&T (single-file v2.7)
-# - Tipo derivado con SERV + T_REG (+ TIPO_COM si existe)
+# app.py — Go Mapper — Compilador AT&T (single-file v2.8)
+# - Sniff de encabezado real en sábanas AT&T (salta filas de portada)
+# - Tipo derivado con SERV + T_REG + TIPO_COM
 # - Hoja adicional Datos_Limpios_669 con columna Teléfono fija
 
 from __future__ import annotations
@@ -36,23 +37,6 @@ def _norm_colname(name: str) -> str:
     name = re.sub(r"\s+", " ", name).strip()
     return name
 
-def _read_any(path: str) -> pd.DataFrame:
-    ext = os.path.splitext(path)[1].lower()
-    if ext in {".xlsx", ".xlsm"}:
-        return pd.read_excel(path)  # openpyxl
-    elif ext == ".xls":
-        return pd.read_excel(path, engine="xlrd")  # xlrd==1.2.0
-    elif ext in {".csv", ".txt"}:
-        for enc in ("utf-8", "latin1"):
-            for sep in (",", ";", "\t", "|"):
-                try:
-                    return pd.read_csv(path, sep=sep, engine="python", encoding=enc)
-                except Exception:
-                    continue
-        return pd.read_csv(path, engine="python", encoding_errors="ignore")
-    else:
-        raise ValueError(f"Extensión no soportada: {ext}")
-
 def _parse_duration_to_seconds(val: Any) -> Optional[int]:
     if pd.isna(val): return None
     if isinstance(val, (int, float)) and not pd.isna(val):
@@ -86,16 +70,84 @@ def _maybe_plus(lat: Any, lon: Any) -> Optional[str]:
     except Exception:
         return None
 
+# ==================== Sniff de encabezado real ====================
+
+HEADER_TOKENS_REQ = {"NO", "FECHA"}  # y al menos uno de DUR / DURACIÓN
+HEADER_TOKENS_ANY = {"DUR", "DURACIÓN"}
+
+def _looks_like_header(row_vals: List[str]) -> bool:
+    up = {str(x).strip().upper() for x in row_vals if pd.notna(x)}
+    return HEADER_TOKENS_REQ.issubset(up) and (len(HEADER_TOKENS_ANY.intersection(up)) > 0)
+
+def _read_excel_with_header_sniff(path: str) -> pd.DataFrame:
+    # 1) Cargamos sin encabezado para examinar primeras ~100 filas
+    raw = pd.read_excel(path, sheet_name=0, header=None, dtype=str)
+    header_row_idx = None
+    max_probe = min(100, len(raw))
+    for i in range(max_probe):
+        if _looks_like_header(raw.iloc[i].tolist()):
+            header_row_idx = i
+            break
+    if header_row_idx is not None:
+        headers = raw.iloc[header_row_idx].tolist()
+        df = raw.iloc[header_row_idx+1:].copy()
+        df.columns = headers
+        df = df.dropna(how="all", axis=1).dropna(how="all").reset_index(drop=True)
+        return df
+    # Fallback: primer fila como encabezado
+    return pd.read_excel(path, sheet_name=0)
+
+def _read_csv_with_header_sniff(path: str) -> pd.DataFrame:
+    # Intento 1: leer normal
+    try:
+        df = pd.read_csv(path, engine="python")
+        if _looks_like_header(list(df.columns)):
+            return df
+    except Exception:
+        pass
+    # Intento 2: leer sin encabezado y buscar la fila correcta
+    try:
+        raw = pd.read_csv(path, engine="python", header=None, dtype=str)
+        header_row_idx = None
+        max_probe = min(100, len(raw))
+        for i in range(max_probe):
+            if _looks_like_header(raw.iloc[i].tolist()):
+                header_row_idx = i
+                break
+        if header_row_idx is not None:
+            headers = raw.iloc[header_row_idx].tolist()
+            df = raw.iloc[header_row_idx+1:].copy()
+            df.columns = headers
+            df = df.dropna(how="all", axis=1).dropna(how="all").reset_index(drop=True)
+            return df
+    except Exception:
+        pass
+    # Último intento
+    return pd.read_csv(path, engine="python", encoding_errors="ignore")
+
+def _read_any_with_sniff(path: str) -> pd.DataFrame:
+    ext = os.path.splitext(path)[1].lower()
+    if ext in {".xlsx", ".xlsm", ".xls"}:
+        if ext == ".xls":
+            # xlrd para xls no soporta header=None con algunos archivos; intentamos normal primero
+            try:
+                return _read_excel_with_header_sniff(path)
+            except Exception:
+                return pd.read_excel(path, engine="xlrd")
+        return _read_excel_with_header_sniff(path)
+    elif ext in {".csv", ".txt"}:
+        return _read_csv_with_header_sniff(path)
+    else:
+        raise ValueError(f"Extensión no soportada: {ext}")
+
 # ==================== Modo estricto AT&T ====================
 
-# ¡Importante!: ya NO colapsamos SERV/T_REG en "tipo".
-# Conservamos serv, t_reg y tipo_com para derivar Tipo correctamente.
 STRICT_ATT_MAP = {
     "no": "registro_id",
     "serv": "serv",
     "t reg": "t_reg", "t_reg": "t_reg",
     "tipo com": "tipo_com", "tipo_com": "tipo_com",
-    "tipo": "tipo_com",  # si llega una columna "Tipo" cruda, la tratamos como tipo_com fallback
+    "tipo": "tipo_com",
     "num a": "numero_a", "num_a": "numero_a",
     "num a imsi": "imsi", "num_a_imsi": "imsi",
     "num a imei": "imei", "num_a_imei": "imei",
@@ -117,7 +169,7 @@ _DATA_TOK  = {"gprs", "datos", "data", "internet", "ps", "pdp", "packet"}
 _SMS_TOK   = {"sms", "mensaje", "mensajes", "2 vias", "2vias", "mms"}
 _TRF_TOK   = {"transfer", "desvio", "desvío", "call forward", "cfu", "cfb", "cfnry", "cfnr", "cfnrc"}
 
-# Dirección de voz
+# Dirección VOZ
 _OUT_TOK = {"mo", "moc", "saliente", "orig", "out", "originating", "salida"}
 _IN_TOK  = {"mt", "mtc", "entrante", "term", "in", "terminating", "entrada"}
 
@@ -126,40 +178,22 @@ def _norm_text(x: Any) -> str:
     return _norm_colname(str(x))
 
 def derive_tipo_from_serv_treg(serv: Any, t_reg: Any, tipo_com: Any = None) -> Optional[str]:
-    """Deriva el Tipo usando SERV + T_REG (+ TIPO_COM si existe) al estándar: VOZ SALIENTE, VOZ ENTRANTE, DATOS, MENSAJES 2 VÍAS, TRANSFER."""
-    s = _norm_text(serv)
-    t = _norm_text(t_reg)
-    c = _norm_text(tipo_com)
-
-    # 1) Transferencia / desvíos
-    if any(tok in s or tok in t or tok in c for tok in _TRF_TOK):
-        return "TRANSFER"
-
-    # 2) Mensajes
-    if any(tok in s or tok in t or tok in c for tok in _SMS_TOK):
-        return "MENSAJES 2 VÍAS"
-
-    # 3) Datos
-    if any(tok in s or tok in t or tok in c for tok in _DATA_TOK):
-        return "DATOS"
-
-    # 4) Voz + dirección
+    s = _norm_text(serv); t = _norm_text(t_reg); c = _norm_text(tipo_com)
+    # Transfer
+    if any(tok in s or tok in t or tok in c for tok in _TRF_TOK): return "TRANSFER"
+    # Mensajes
+    if any(tok in s or tok in t or tok in c for tok in _SMS_TOK): return "MENSAJES 2 VÍAS"
+    # Datos
+    if any(tok in s or tok in t or tok in c for tok in _DATA_TOK): return "DATOS"
+    # Voz + dirección
     is_voice = any(tok in s or tok in c for tok in _VOICE_TOK) or ("call" in t) or ("moc" in t) or ("mtc" in t)
     if is_voice:
-        if any(tok in t or tok in s or tok in c for tok in _OUT_TOK):
-            return "VOZ SALIENTE"
-        if any(tok in t or tok in s or tok in c for tok in _IN_TOK):
-            return "VOZ ENTRANTE"
-        # Si sabemos que es voz pero no hay dirección clara, asumimos saliente (criterio Telcel)
+        if any(tok in t or tok in s or tok in c for tok in _OUT_TOK): return "VOZ SALIENTE"
+        if any(tok in t or tok in s or tok in c for tok in _IN_TOK):  return "VOZ ENTRANTE"
         return "VOZ SALIENTE"
-
-    # 5) Últimos intentos: si T_REG dice algo claro sin SERV
-    if any(tok in t for tok in _OUT_TOK):
-        return "VOZ SALIENTE"
-    if any(tok in t for tok in _IN_TOK):
-        return "VOZ ENTRANTE"
-
-    # 6) Sin clasificar
+    # Si T_REG deja claro IN/OUT:
+    if any(tok in t for tok in _OUT_TOK): return "VOZ SALIENTE"
+    if any(tok in t for tok in _IN_TOK):  return "VOZ ENTRANTE"
     return None
 
 def _dir_voz(tipo: Optional[str]) -> Optional[str]:
@@ -181,15 +215,14 @@ def _strict_att_normalize(raw_df: pd.DataFrame, tz: Optional[str]) -> pd.DataFra
     df["Número A"] = df.get("numero_a")
     df["Número B"] = df.get("numero_b")
 
-    # === Tipo derivado (SERV + T_REG + TIPO_COM) ===
+    # 3) Tipo derivado (SERV + T_REG + TIPO_COM)
     df["Tipo"] = df.apply(
         lambda r: derive_tipo_from_serv_treg(r.get("serv"), r.get("t_reg"), r.get("tipo_com")),
         axis=1
     )
-    # Dirección VOZ
     df["Dirección del tráfico (VOZ)"] = df["Tipo"].apply(_dir_voz)
 
-    # 3) Datetime a partir de FECHA/HORA (texto o serial numérico)
+    # 4) Datetime a partir de FECHA/HORA (texto o serial)
     fecha = df.get("fecha")
     hora  = df.get("hora")
     dt = pd.Series([pd.NaT]*len(df), dtype="datetime64[ns]")
@@ -201,7 +234,6 @@ def _strict_att_normalize(raw_df: pd.DataFrame, tz: Optional[str]) -> pd.DataFra
             dt[f_isnum] = _excel_days_to_datetime(f_num[f_isnum])
         if (~f_isnum).any():
             dt[~f_isnum] = pd.to_datetime(fecha[~f_isnum], errors="coerce", dayfirst=True)
-
         if hora is not None:
             h_str = hora.astype(str).str.strip()
             hhmmss = h_str.str.match(r"^\d{1,2}:[0-5]\d(:[0-5]\d)?$")
@@ -225,7 +257,7 @@ def _strict_att_normalize(raw_df: pd.DataFrame, tz: Optional[str]) -> pd.DataFra
 
     df["Datetime"] = dt.apply(lambda x: _to_local_naive(x, tz) if pd.notna(x) else x)
 
-    # 4) Duración
+    # 5) Duración
     if "duracion_seg" in df.columns:
         dur = df["duracion_seg"].apply(_parse_duration_to_seconds)
         as_num = pd.to_numeric(df["duracion_seg"], errors="coerce")
@@ -299,7 +331,7 @@ def compile_att_sabanas_strict(file_paths: List[str], tz: Optional[str]) -> Comp
     frames, logs = [], []
     for path in file_paths:
         try:
-            raw = _read_any(path)
+            raw = _read_any_with_sniff(path)
             raw["Archivo_Origen"] = os.path.basename(path)
             df = _strict_att_normalize(raw, tz=tz)
             frames.append(df)
@@ -307,10 +339,10 @@ def compile_att_sabanas_strict(file_paths: List[str], tz: Optional[str]) -> Comp
                 "archivo": os.path.basename(path),
                 "filas": len(df),
                 "columnas_origen": ", ".join(map(str, raw.columns)),
-                "modo": "estricto_AT&T"
+                "modo": "estricto_AT&T + header-sniff"
             })
         except Exception as e:
-            logs.append({"archivo": os.path.basename(path), "error": repr(e), "modo": "estricto_AT&T"})
+            logs.append({"archivo": os.path.basename(path), "error": repr(e), "modo": "estricto_AT&T + header-sniff"})
     if not frames:
         return CompileResult(
             pd.DataFrame(columns=[
@@ -361,7 +393,6 @@ def compile_att_sabanas_strict(file_paths: List[str], tz: Optional[str]) -> Comp
 # ==================== Hoja extra tipo “669” (con Teléfono) ====================
 
 def build_hoja_669(df: pd.DataFrame, telefono: str) -> pd.DataFrame:
-    """Construye el formato '669xxxx limpio.xlsx' con columna Teléfono fija."""
     out_cols = [
         'Teléfono','Tipo','Número A','Número B','Fecha','Hora','Duración (seg)','IMEI',
         'Latitud','Longitud','Azimuth','Latitud_raw','Longitud_raw','Azimuth_raw',
@@ -369,11 +400,9 @@ def build_hoja_669(df: pd.DataFrame, telefono: str) -> pd.DataFrame:
     ]
     res = pd.DataFrame(index=range(len(df)), columns=out_cols)
 
-    # Teléfono fijo (MSISDN objetivo)
     tel = str(telefono).strip() if telefono else None
     res['Teléfono'] = tel
 
-    # Copias directas cuando existan
     res['Tipo'] = df.get('Tipo')
     res['Número A'] = df.get('Número A')
     res['Número B'] = df.get('Número B')
@@ -386,18 +415,17 @@ def build_hoja_669(df: pd.DataFrame, telefono: str) -> pd.DataFrame:
     res['Azimuth_deg'] = df.get('Azimuth_deg')
     res['Datetime'] = pd.to_datetime(df.get('Datetime'), errors='coerce')
 
-    # Derivados/Raw
+    # Raw
     res['Latitud_raw'] = df.get('Latitud').astype(str).where(df.get('Latitud').notna(), None)
     res['Longitud_raw'] = df.get('Longitud').astype(str).where(df.get('Longitud').notna(), None)
     res['Azimuth_raw'] = df.get('Azimuth_deg').astype(str).where(df.get('Azimuth_deg').notna(), None)
-    res['Azimuth'] = df.get('Azimuth_deg')  # si no hay string, usamos el grado numérico
+    res['Azimuth'] = df.get('Azimuth_deg')
 
-    # Fecha/Hora desde Datetime
     dt = res['Datetime']
     res['Fecha'] = dt.dt.strftime('%d/%m/%Y').where(dt.notna(), None)
     res['Hora']  = dt.dt.strftime('%H:%M:%S').where(dt.notna(), None)
 
-    # Duplicados (regla DATOS/min)
+    # Duplicados (DATOS/min)
     res['Es_Duplicado'] = False
     res['Cuenta_GrupoDup'] = 1
     mask_datos = res['Tipo'] == 'DATOS'
@@ -436,7 +464,7 @@ def build_excel(df: pd.DataFrame, log: pd.DataFrame, dupes: pd.DataFrame, stats:
 # ==================== UI ====================
 
 st.title("📞 Go Mapper — Compilador AT&T (single-file)")
-st.caption("Tipo derivado con **SERV + T_REG + TIPO_COM**, y hoja adicional **Datos_Limpios_669** con columna **Teléfono** fija.")
+st.caption("Detecta el encabezado real, deriva **Tipo** con `SERV+T_REG+TIPO_COM` y puede generar la hoja **Datos_Limpios_669** con la columna **Teléfono** fija.")
 
 st.sidebar.header("Parámetros")
 tz = st.sidebar.text_input("Zona horaria", value="America/Mazatlan")
@@ -472,7 +500,7 @@ if go:
                         w.write(f.getvalue())
                     tmp_paths.append(p)
 
-                with st.spinner("Compilando y normalizando (estricto AT&T)…"):
+                with st.spinner("Compilando y normalizando (estricto AT&T, header-sniff)…"):
                     res = compile_att_sabanas_strict(tmp_paths, tz=tz)
 
                 st.success(f"✅ Compilado: {len(res.df):,} filas | Archivos: {len(files)}")
@@ -503,10 +531,9 @@ if go:
 st.markdown("""
 ---
 **Notas**
-- Encabezados esperados (insensible a mayúsculas/acentos):  
-`NO, SERV, T_REG, NUM_A, NUM_A_IMSI, NUM_A_IMEI, DEST, ID_DEST, HUSO, FECHA, HORA, DUR, USO_DW, USO_UP, ID_CELDA, LATITUD, LONGITUD, AZIMUTH, CAUSA_T, TIPO_COM, PAIS`.
-- **Tipo** se deriva de `SERV`, `T_REG` y `TIPO_COM` → `VOZ SALIENTE / VOZ ENTRANTE / DATOS / MENSAJES 2 VÍAS / TRANSFER`.
-- La hoja **Datos_Limpios_669** fija la columna **Teléfono** al MSISDN objetivo que escribas en la barra lateral.
+- Encabezado: si la sábana trae “portada”, el motor busca la fila que contenga `NO`, `FECHA` y `DUR` y usa esa como encabezado real.
+- **Tipo**: se deriva de `SERV`, `T_REG` y `TIPO_COM` → `VOZ SALIENTE / VOZ ENTRANTE / DATOS / MENSAJES 2 VÍAS / TRANSFER`.
+- **Datos_Limpios_669**: fija **Teléfono** al MSISDN objetivo (ej. `526691634209`).
 - FECHA/HORA: acepta serial de Excel (número) o texto (`dd/mm/aaaa` y `HH:MM(:SS)`).
 - DUR: acepta segundos, fracción de día (<1) o `HH:MM:SS`.
 - Dedupe *DATOS/min*: conserva el registro de mayor duración por par A/B por minuto.
