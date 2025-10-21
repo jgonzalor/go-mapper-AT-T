@@ -1,9 +1,7 @@
-# app.py — AT&T → Limpieza (20 cols) + Geocoding + Estadísticos — interfaz de Limpieza
-# Single-file listo para Streamlit
+# app.py — AT&T → Limpieza (20 cols) + Estadísticos + Geocoding HTTP (sin geopy) — v3.4
 
 from __future__ import annotations
-import io, os, re, time, sqlite3, unicodedata, tempfile
-from contextlib import closing
+import io, os, re, time, tempfile, unicodedata
 from functools import lru_cache
 from typing import Any, List, Dict, Tuple, Optional
 
@@ -27,15 +25,14 @@ except Exception:
 # CONFIG STREAMLIT
 # ===========================
 st.set_page_config(
-    page_title="Go Mapper — AT&T → Limpieza",
+    page_title="Go Mapper — AT&T → Limpieza (20 cols)",
     page_icon="📞",
     layout="wide",
-    menu_items={"Get help": None, "Report a bug": None, "About": None}
 )
 
 st.title("📞 Go Mapper — Compilador AT&T (igual a Limpieza)")
-st.write("Convierte sábanas de AT&T al formato **Datos_Limpios (20 columnas)**, genera **PLUS_CODE** y **dirección**, "
-         "calcula **estadísticos** y exporta un Excel idéntico al de Limpieza.")
+st.write("Convierte sábanas de AT&T al formato **Datos_Limpios (20 columnas)**, genera **PLUS_CODE** y **dirección** (vía HTTP), "
+         "calcula **estadísticos** y exporta un Excel como en la app de Limpieza.")
 
 # ===========================
 # PARÁMETROS UI
@@ -46,41 +43,21 @@ remove_dups = st.sidebar.checkbox(
     "Eliminar duplicados de DATOS por minuto (A/B), conservar la mayor duración",
     value=False
 )
+enable_geocode = st.sidebar.checkbox("Geocoding HTTP (Nominatim/BigDataCloud/Keys opcionales)", value=True)
 show_preview = st.sidebar.checkbox("Mostrar preview", value=True)
 
-# Geocoding: configuración
+# Geocoding HTTP: configuración básica
 CONTACT_EMAIL = os.getenv("CONTACT_EMAIL", "contacto@example.com")
-CONTACT_URL   = os.getenv("CONTACT_URL", "")
-APP_VER       = "att-limpieza/1.0.0"
-USER_AGENT    = f"{APP_VER} ({CONTACT_EMAIL})" if not CONTACT_URL else f"{APP_VER} (+{CONTACT_URL}; {CONTACT_EMAIL})"
+APP_VER       = "att-limpieza/3.4"
+USER_AGENT    = f"{APP_VER} (+{CONTACT_EMAIL})"
 
 NOMINATIM_URL = os.getenv("NOMINATIM_URL", "https://nominatim.openstreetmap.org").rstrip("/")
-def _host_from_url(url: str) -> str:
-    return re.sub(r"^https?://", "", url, flags=re.I).rstrip("/")
-NOMINATIM_HOST = _host_from_url(NOMINATIM_URL)
-
-ALT_URLS = [u.strip().rstrip("/") for u in os.getenv("NOMINATIM_ALT_URLS", "").split(",") if u.strip()]
-ALT_HOSTS = [_host_from_url(u) for u in ALT_URLS]
-HOSTS_CHAIN = [NOMINATIM_HOST] + ALT_HOSTS
-URLS_CHAIN  = [NOMINATIM_URL]  + ALT_URLS
-
 OPENCAGE_KEY   = os.getenv("OPENCAGE_API_KEY")   or st.secrets.get("OPENCAGE_API_KEY", "")
 LOCATIONIQ_KEY = os.getenv("LOCATIONIQ_API_KEY") or st.secrets.get("LOCATIONIQ_API_KEY", "")
 
 GEOCODER_TIMEOUT      = 20
-PER_COORD_MAX_TRIES   = 2
-MAX_UNIQUE_GEOCODES   = 1000
+MAX_UNIQUE_GEOCODES   = 800
 COORD_PRECISION_CACHE = 6
-CACHE_DB_PATH         = "geo_cache.sqlite"
-GEOCODE_ENABLED       = True
-
-# Sanity OLC
-try:
-    if HAS_OLC:
-        _olc_demo = olc.encode(19.4326, -99.1332, codeLength=10)
-        st.caption(f"Sanity OLC (CDMX): {_olc_demo}")
-except Exception as _e:
-    st.error(f"[Sanity OLC] Falló: {_e}")
 
 # ===========================
 # PROGRESO
@@ -139,7 +116,7 @@ def plus_code(lat, lon):
         return None
 
 # ===========================
-# DMS / COORDENADAS (como Limpieza)
+# DMS / COORDENADAS
 # ===========================
 def dms_to_decimal(value):
     if pd.isna(value):
@@ -159,11 +136,6 @@ def dms_to_decimal(value):
         return float(value.replace(",", "."))
     except:
         return None
-
-def ensure_lat_lon_columns(df: pd.DataFrame) -> pd.DataFrame:
-    if {"Latitud","Longitud"}.issubset(df.columns):
-        return df
-    return df
 
 # ===========================
 # HEADER SNIFF AT&T
@@ -209,7 +181,7 @@ def read_any_with_sniff(path: str) -> pd.DataFrame:
         return pd.read_csv(path, engine="python", encoding_errors="ignore")
 
 # ===========================
-# AT&T → Datos_Limpios (20 columnas, igual Limpieza)
+# AT&T → Datos_Limpios (20 columnas)
 # ===========================
 OUT_COLS = ['Teléfono','Tipo','Número A','Número B','Fecha','Hora','Duración (seg)','IMEI',
             'Latitud','Longitud','Azimuth','Latitud_raw','Longitud_raw','Azimuth_raw',
@@ -260,7 +232,7 @@ def transform_att_to_limpio(df: pd.DataFrame, telefono_fijo: Optional[str]) -> p
                         for lat, lon in zip(out['Latitud'], out['Longitud'])]
     out['PLUS_CODE_NOMBRE'] = None
 
-    # Datetime robusto (dayfirst)
+    # Datetime (dayfirst)
     dt = pd.to_datetime(out['Fecha'].astype(str).str.strip() + " " + out['Hora'].astype(str).str.strip(),
                         errors="coerce", dayfirst=True)
     out['Datetime'] = dt
@@ -271,7 +243,7 @@ def transform_att_to_limpio(df: pd.DataFrame, telefono_fijo: Optional[str]) -> p
     return out[OUT_COLS]
 
 # ===========================
-# DEDUPE DATOS (minuto, igual filosofía)
+# DEDUPE DATOS (minuto)
 # ===========================
 def dedupe_datos_by_minute(df: pd.DataFrame):
     if df is None or df.empty or "Tipo" not in df.columns:
@@ -295,26 +267,10 @@ def dedupe_datos_by_minute(df: pd.DataFrame):
     return out, duplicados_df, len(duplicados_df)
 
 # ===========================
-# GEOCODING (cadena de proveedores + caché)
+# GEOCODING HTTP (sin geopy) + caché en memoria
 # ===========================
-from geopy.geocoders import Nominatim
-from geopy.extra.rate_limiter import RateLimiter
-
-_GEOPY_REV_BY_HOST: Dict[str, RateLimiter] = {}
-def _get_geopy_reverse_for_host(host: str) -> RateLimiter:
-    if host not in _GEOPY_REV_BY_HOST:
-        geolocator = Nominatim(user_agent=USER_AGENT, timeout=GEOCODER_TIMEOUT, domain=host)
-        _GEOPY_REV_BY_HOST[host] = RateLimiter(
-            geolocator.reverse,
-            min_delay_seconds=1.8,
-            max_retries=1,
-            error_wait_seconds=1.2,
-            swallow_exceptions=False
-        )
-    return _GEOPY_REV_BY_HOST[host]
-
-def _reverse_http_base(base_url: str, lat, lon, lang="es", timeout=GEOCODER_TIMEOUT+5) -> str:
-    url = f"{base_url}/reverse"
+def _reverse_nominatim(lat, lon, lang="es") -> str:
+    url = f"{NOMINATIM_URL}/reverse"
     params = {
         "format": "jsonv2",
         "lat": f"{float(lat):.6f}",
@@ -325,18 +281,15 @@ def _reverse_http_base(base_url: str, lat, lon, lang="es", timeout=GEOCODER_TIME
         "email": CONTACT_EMAIL
     }
     headers = {"User-Agent": USER_AGENT}
-    r = requests.get(url, params=params, headers=headers, timeout=timeout)
+    r = requests.get(url, params=params, headers=headers, timeout=GEOCODER_TIMEOUT)
     r.raise_for_status()
     data = r.json()
     if isinstance(data, dict):
-        name = data.get("display_name", "") or ""
-        if name:
-            return name
+        return data.get("display_name") or ""
     return ""
 
-def _reverse_locationiq(lat, lon, lang="es"):
-    if not LOCATIONIQ_KEY:
-        return ""
+def _reverse_locationiq(lat, lon, lang="es") -> str:
+    if not LOCATIONIQ_KEY: return ""
     url = "https://us1.locationiq.com/v1/reverse"
     params = {
         "key": LOCATIONIQ_KEY,
@@ -352,9 +305,8 @@ def _reverse_locationiq(lat, lon, lang="es"):
     js = r.json()
     return (js.get("display_name") or "") if isinstance(js, dict) else ""
 
-def _reverse_opencage(lat, lon, lang="es"):
-    if not OPENCAGE_KEY:
-        return ""
+def _reverse_opencage(lat, lon, lang="es") -> str:
+    if not OPENCAGE_KEY: return ""
     url = "https://api.opencagedata.com/geocode/v1/json"
     params = {
         "q": f"{float(lat):.6f},{float(lon):.6f}",
@@ -370,7 +322,7 @@ def _reverse_opencage(lat, lon, lang="es"):
         return js["results"][0].get("formatted", "") or ""
     return ""
 
-def _reverse_bigdatacloud(lat, lon, lang="es"):
+def _reverse_bigdatacloud(lat, lon, lang="es") -> str:
     url = "https://api.bigdatacloud.net/data/reverse-geocode-client"
     params = {
         "latitude": float(lat),
@@ -380,89 +332,32 @@ def _reverse_bigdatacloud(lat, lon, lang="es"):
     r = requests.get(url, params=params, timeout=GEOCODER_TIMEOUT)
     r.raise_for_status()
     js = r.json()
-    if not isinstance(js, dict):
-        return ""
+    if not isinstance(js, dict): return ""
     parts = [
         js.get("locality") or js.get("city"),
         js.get("principalSubdivision"),
         js.get("countryName"),
     ]
-    parts2 = [p or "" for p in parts]
-    out = ", ".join([p for p in parts2 if p])
-    return out
+    out = ", ".join([p for p in parts if p])
+    return out or ""
 
 @lru_cache(maxsize=10000)
 def reverse_best_cached(lat_round, lon_round, lang="es") -> str:
-    # Geopy por host → HTTP por URL → LocationIQ → OpenCage → BigDataCloud
+    # Orden: Nominatim → LocationIQ (si key) → OpenCage (si key) → BigDataCloud
     for L in [lang, "es", "es-mx", "en"]:
-        for host in HOSTS_CHAIN:
+        for fn in (_reverse_nominatim, _reverse_locationiq, _reverse_opencage, _reverse_bigdatacloud):
             try:
-                rev = _get_geopy_reverse_for_host(host)
-                res = rev((lat_round, lon_round), language=L, addressdetails=True, zoom=18, timeout=GEOCODER_TIMEOUT)
-                if res and getattr(res, "address", None):
-                    return res.address
-                if isinstance(res, dict) and res.get("display_name"):
-                    return res["display_name"]
+                txt = fn(lat_round, lon_round, L)
+                if txt: return txt
             except Exception:
-                pass
-        for base in URLS_CHAIN:
-            try:
-                name = _reverse_http_base(base, lat_round, lon_round, lang=L)
-                if name: return name
-            except Exception:
-                pass
-        try:
-            name = _reverse_locationiq(lat_round, lon_round, lang=L)
-            if name: return name
-        except Exception:
-            pass
-        try:
-            name = _reverse_opencage(lat_round, lon_round, lang=L)
-            if name: return name
-        except Exception:
-            pass
-        try:
-            name = _reverse_bigdatacloud(lat_round, lon_round, lang=L)
-            if name: return name
-        except Exception:
-            pass
+                continue
     return ""
 
 def reverse_address(lat, lon, lang="es", precision=COORD_PRECISION_CACHE) -> str:
-    lt = round(float(lat), precision); ln = round(float(lon), precision)
-    return reverse_best_cached(lt, ln, lang=lang)
-
-def init_cache_db():
-    with closing(sqlite3.connect(CACHE_DB_PATH)) as con:
-        con.execute("""CREATE TABLE IF NOT EXISTS geocache (
-            lat REAL NOT NULL, lon REAL NOT NULL, addr TEXT, PRIMARY KEY(lat, lon)
-        )""")
-        con.execute("PRAGMA journal_mode=WAL;")
-        con.commit()
-
-def cache_get_many(keys: List[Tuple[float,float]]) -> Dict[Tuple[float,float], str]:
-    if not keys:
-        return {}
-    q_marks = ",".join(["(?,?)"] * len(keys))
-    params = [v for pair in keys for v in pair]
-    with closing(sqlite3.connect(CACHE_DB_PATH)) as con:
-        rows = con.execute(
-            f"SELECT lat, lon, COALESCE(addr,'') FROM geocache WHERE (lat,lon) IN ({q_marks})", params
-        ).fetchall()
-    return {(r[0], r[1]): r[2] for r in rows}
-
-def cache_upsert_many(items: Dict[Tuple[float,float], str]) -> None:
-    if not items:
-        return
-    with closing(sqlite3.connect(CACHE_DB_PATH)) as con:
-        con.executemany(
-            "INSERT OR REPLACE INTO geocache(lat,lon,addr) VALUES(?,?,?)",
-            [(k[0], k[1], v or "") for k, v in items.items()]
-        )
-        con.commit()
+    return reverse_best_cached(round(float(lat), precision), round(float(lon), precision), lang)
 
 # ===========================
-# ESTADÍSTICOS (idénticos en espíritu)
+# ESTADÍSTICOS (como Limpieza)
 # ===========================
 def _clean_number(x: str) -> str:
     if x is None or (isinstance(x, float) and pd.isna(x)):
@@ -471,6 +366,13 @@ def _clean_number(x: str) -> str:
 
 def build_statistics_blocks(df: pd.DataFrame) -> List[Tuple[str, pd.DataFrame]]:
     blocks: List[Tuple[str, pd.DataFrame]] = []
+    if df.empty:
+        return blocks
+
+    # Excluir duplicados marcados
+    if "Es_Duplicado" in df.columns:
+        df = df[~df["Es_Duplicado"].fillna(False)].copy()
+
     tel_col = "Teléfono" if "Teléfono" in df.columns else None
     numA, numB = df.get("Número A"), df.get("Número B")
     tipo = df.get("Tipo")
@@ -523,33 +425,35 @@ def build_statistics_blocks(df: pd.DataFrame) -> List[Tuple[str, pd.DataFrame]]:
         dir_rows.append([nombre, n, dsum, dmean])
     blocks.append(("2) Dirección del tráfico (VOZ)", pd.DataFrame(dir_rows, columns=["Dirección","# Llamadas","Duración total (s)","Duración media (s)"])))
 
+    # Top 10 salientes
     if numB is not None:
         sal = pd.DataFrame(df[out_mask])
         if not sal.empty:
             sal = sal.assign(Contraparte=B_clean[out_mask].values)
             sal["Duración (seg)"] = pd.to_numeric(sal["Duración (seg)"], errors="coerce")
             top_sal = (sal.groupby("Contraparte", dropna=True)
-                .agg(Llamadas=("Datetime","count"),
-                     Duración_total_s=("Duración (seg)","sum"),
-                     Primera=("Datetime","min"),
-                     Última=("Datetime","max"))
-                .reset_index().rename(columns={"Contraparte":"Número"}))
+                       .agg(Llamadas=("Datetime","count"),
+                            Duración_total_s=("Duración (seg)","sum"),
+                            Primera=("Datetime","min"),
+                            Última=("Datetime","max"))
+                       .reset_index().rename(columns={"Contraparte":"Número"}))
             top_sal = top_sal.sort_values(["Llamadas","Duración_total_s"], ascending=[False,False]).head(10)
             blocks.append(("3) Top 10 contactos SALIENTES", top_sal))
         else:
             blocks.append(("3) Top 10 contactos SALIENTES", pd.DataFrame(columns=["Número","Llamadas","Duración_total_s","Primera","Última"])))
 
+    # Top 10 entrantes
     if numA is not None:
         ent = pd.DataFrame(df[in_mask])
         if not ent.empty:
             ent = ent.assign(Contraparte=A_clean[in_mask].values)
             ent["Duración (seg)"] = pd.to_numeric(ent["Duración (seg)"], errors="coerce")
             top_ent = (ent.groupby("Contraparte", dropna=True)
-                .agg(Llamadas=("Datetime","count"),
-                     Duración_total_s=("Duración (seg)","sum"),
-                     Primera=("Datetime","min"),
-                     Última=("Datetime","max"))
-                .reset_index().rename(columns={"Contraparte":"Número"}))
+                       .agg(Llamadas=("Datetime","count"),
+                            Duración_total_s=("Duración (seg)","sum"),
+                            Primera=("Datetime","min"),
+                            Última=("Datetime","max"))
+                       .reset_index().rename(columns={"Contraparte":"Número"}))
             top_ent = top_ent.sort_values(["Llamadas","Duración_total_s"], ascending=[False,False]).head(10)
             blocks.append(("4) Top 10 contactos ENTRANTES", top_ent))
         else:
@@ -566,13 +470,11 @@ def build_statistics_blocks(df: pd.DataFrame) -> List[Tuple[str, pd.DataFrame]]:
     tipos_orden = ["DATOS", "VOZ ENTRANTE", "VOZ SALIENTE", "MENSAJES 2 VÍAS", "TRANSFER"]
     letras = ["A","B","C","D","E"]; idx = 0
     tipo_norm = df["Tipo"].astype(str).str.upper()
+    dt = pd.to_datetime(df.get("Datetime"), errors="coerce")
     for tnombre in tipos_orden:
         mask_t = tipo_norm.eq(tnombre)
         if not mask_t.any(): continue
-        tmp = pd.DataFrame({
-            "Antena": antena_series[mask_t],
-            "Datetime": dt[mask_t]
-        })
+        tmp = pd.DataFrame({"Antena": antena_series[mask_t], "Datetime": dt[mask_t]})
         tmp = tmp[tmp["Antena"].astype(str).str.len() > 0]
         if tmp.empty: continue
         top_ant_t = (tmp.groupby("Antena")
@@ -652,14 +554,11 @@ if go:
             tel_fijo = telefono_fijo.strip() or None
             limpio = transform_att_to_limpio(raw_all, telefono_fijo=tel_fijo)
 
-            # Resguardo originales geo
-            progress_section(progress, 30, "📝 Resguardando geo originales…")
+            # Resguardo originales geo + conversión DMS/decimal y corregir longitud negativa
+            progress_section(progress, 30, "🧭 Convirtiendo coordenadas…")
             for col in ["Latitud","Longitud","Azimuth"]:
                 if col in limpio.columns and f"{col}_raw" not in limpio.columns:
                     limpio[f"{col}_raw"] = limpio[col].astype(str)
-
-            # Convirtiendo a decimal y corrigiendo longitud negativa
-            progress_section(progress, 36, "🧭 Convirtiendo coordenadas…")
             if "Latitud" in limpio.columns:
                 limpio["Latitud"]  = limpio["Latitud"].apply(dms_to_decimal)
             if "Longitud" in limpio.columns:
@@ -667,46 +566,40 @@ if go:
                 limpio["Longitud"] = limpio["Longitud"].apply(lambda x: -abs(x) if pd.notna(x) else x)
 
             # PLUS_CODE offline si hay coords
-            progress_section(progress, 46, "➕ Generando PLUS_CODE…")
+            progress_section(progress, 40, "➕ Generando PLUS_CODE…")
             mask_coords = limpio["Latitud"].notna() & limpio["Longitud"].notna()
             if HAS_OLC and mask_coords.any():
                 limpio.loc[mask_coords,"PLUS_CODE"] = limpio.loc[mask_coords].apply(
                     lambda x: plus_code(x["Latitud"], x["Longitud"]), axis=1
                 )
 
-            # Geocoding con caché
-            progress_section(progress, 62, "🌍 Geocodificando direcciones…")
-            if GEOCODE_ENABLED and mask_coords.any():
-                init_cache_db()
+            # Geocoding HTTP opcional
+            progress_section(progress, 62, "🌍 Geocodificando direcciones (HTTP)…")
+            if enable_geocode and mask_coords.any():
+                # caché simple en memoria de la sesión
+                if "geo_cache" not in st.session_state:
+                    st.session_state.geo_cache = {}
+                cache: Dict[Tuple[float,float], str] = st.session_state.geo_cache
+
                 coords_unique = limpio.loc[mask_coords, ["Latitud","Longitud"]].drop_duplicates().reset_index(drop=True)
                 keys = [(round(float(r["Latitud"]), COORD_PRECISION_CACHE),
                          round(float(r["Longitud"]), COORD_PRECISION_CACHE)) for _, r in coords_unique.iterrows()]
-                cache_hits = cache_get_many(keys)
-                ubic_map: Dict[Tuple[float,float], str] = dict(cache_hits)
-                missing = [k for k in keys if k not in ubic_map]
-                to_resolve = missing[:int(MAX_UNIQUE_GEOCODES)]
-                new_inserts: Dict[Tuple[float,float], str] = {}
-                resueltos = 0
+                missing = [k for k in keys if k not in cache]
+                to_resolve = missing[:MAX_UNIQUE_GEOCODES]
 
                 for idx, (lt, ln) in enumerate(to_resolve, 1):
                     addr = (reverse_address(lt, ln, lang="es")
                             or reverse_address(lt, ln, lang="es-mx")
-                            or reverse_address(lt, ln, lang="en"))
-                    if addr: resueltos += 1
-                    else:    addr = "SIN_DIRECCIÓN"
-                    ubic_map[(lt, ln)] = addr
-                    new_inserts[(lt, ln)] = addr
+                            or reverse_address(lt, ln, lang="en")
+                            or "SIN_DIRECCIÓN")
+                    cache[(lt, ln)] = addr
                     pct = 62 + int(idx / max(len(to_resolve), 1) * (86 - 62))
-                    progress_section(progress, pct, f"🌍 {idx}/{len(to_resolve)} — resueltas: {resueltos}")
-
-                if new_inserts:
-                    cache_upsert_many(new_inserts)
+                    progress_section(progress, pct, f"🌍 {idx}/{len(to_resolve)} coordenadas geocodificadas")
 
                 def pick_name(lat, lon, curr):
                     if pd.notna(curr) and str(curr).strip(): return curr
                     k = (round(float(lat), COORD_PRECISION_CACHE), round(float(lon), COORD_PRECISION_CACHE))
-                    v = ubic_map.get(k, "")
-                    return v if v else "SIN_DIRECCIÓN"
+                    return cache.get(k, "SIN_DIRECCIÓN")
 
                 limpio.loc[mask_coords, "PLUS_CODE_NOMBRE"] = limpio.loc[mask_coords].apply(
                     lambda x: pick_name(x["Latitud"], x["Longitud"], x["PLUS_CODE_NOMBRE"]), axis=1
@@ -723,19 +616,6 @@ if go:
             # Duplicados DATOS por minuto (opcional)
             progress_section(progress, 92, "🧽 Procesando duplicados (DATOS)…")
             duplicados_df = pd.DataFrame(); eliminados = 0
-            # Marcado informativo general
-            subset_general = [c for c in ["Número A","Número B","Datetime"] if c in limpio.columns]
-            if subset_general:
-                dup_mask_all = limpio.duplicated(subset=subset_general, keep=False)
-                limpio["Es_Duplicado"] = dup_mask_all
-                key_col = subset_general[0]
-                try:
-                    limpio["Cuenta_GrupoDup"] = limpio.groupby(subset_general, dropna=False)[key_col].transform("size")
-                except TypeError:
-                    limpio["Cuenta_GrupoDup"] = limpio.groupby(subset_general)[key_col].transform("size")
-            else:
-                limpio["Es_Duplicado"] = False; limpio["Cuenta_GrupoDup"] = 1
-
             if remove_dups:
                 limpio, duplicados_df, eliminados = dedupe_datos_by_minute(limpio)
 
@@ -764,30 +644,25 @@ if go:
             progress_section(progress, 96, "📊 Calculando estadísticas…")
             stat_blocks = build_statistics_blocks(limpio)
 
-            # EXPORTAR EXCEL (como Limpieza)
+            # EXPORTAR EXCEL
             progress_section(progress, 98, "📦 Exportando a Excel…")
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine="openpyxl") as writer:
                 limpio.to_excel(writer, sheet_name="Datos_Limpios", index=False)
-                # Juntar LOGs (resumen general + por archivo)
-                with pd.ExcelWriter(output) as _:
-                    pass
                 log_df.to_excel(writer, sheet_name="LOG_Limpieza", index=False, startrow=0)
                 log_df2.to_excel(writer, sheet_name="LOG_Limpieza", index=False, startrow=len(log_df)+2)
-
                 if not duplicados_df.empty:
                     duplicados_df.to_excel(writer, sheet_name="Duplicados", index=False)
-
                 # Hoja ESTADISTICAS
-                start = 0
-                ws_title_positions: List[Tuple[int, str]] = []
+                start = 0; ws_title_positions: List[Tuple[int, str]] = []
                 for title, bdf in stat_blocks:
                     bdf.to_excel(writer, sheet_name="ESTADISTICAS", index=False, startrow=start+1, startcol=0)
                     ws_title_positions.append((start+1, title))
                     start = start + 1 + 1 + len(bdf) + 1
 
-            # Post-format con openpyxl (tablas, anchos, IMEI como texto/0)
+            # Post format
             output.seek(0); wb = load_workbook(output)
+
             ws = wb["Datos_Limpios"]
             if "IMEI" in limpio.columns:
                 imei_col = limpio.columns.get_loc("IMEI") + 1
