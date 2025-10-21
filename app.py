@@ -1,7 +1,8 @@
-# app.py — Go Mapper — Compilador AT&T (single-file v2.8)
-# - Sniff de encabezado real en sábanas AT&T (salta filas de portada)
-# - Tipo derivado con SERV + T_REG + TIPO_COM
-# - Hoja adicional Datos_Limpios_669 con columna Teléfono fija
+# app.py — Go Mapper — Compilador AT&T (single-file v3.1)
+# - TODO en un solo archivo (sin modules ni pages)
+# - Detecta encabezado real (salta “portada” de AT&T)
+# - Deriva Tipo con SERV + T_REG + TIPO_COM (estándar Telcel)
+# - Hoja opcional Datos_Limpios_669 con columna Teléfono fija
 
 from __future__ import annotations
 import os, io, re, tempfile
@@ -30,12 +31,10 @@ def _strip_accents(text: str) -> str:
 def _norm_colname(name: str) -> str:
     name = _strip_accents(str(name)).strip().lower()
     name = re.sub(r"\s+", " ", name)
-    name = name.replace("/", " ").replace("-", " ")
-    name = name.replace("(", " ").replace(")", " ")
-    name = name.replace("[", " ").replace("]", " ")
+    for ch in ["/","-","(",")","[","]"]:
+        name = name.replace(ch, " ")
     name = re.sub(r"[^a-z0-9 ]+", " ", name)
-    name = re.sub(r"\s+", " ", name).strip()
-    return name
+    return re.sub(r"\s+", " ", name).strip()
 
 def _parse_duration_to_seconds(val: Any) -> Optional[int]:
     if pd.isna(val): return None
@@ -72,68 +71,55 @@ def _maybe_plus(lat: Any, lon: Any) -> Optional[str]:
 
 # ==================== Sniff de encabezado real ====================
 
-HEADER_TOKENS_REQ = {"NO", "FECHA"}  # y al menos uno de DUR / DURACIÓN
-HEADER_TOKENS_ANY = {"DUR", "DURACIÓN"}
+_HEADER_REQ = {"NO", "FECHA"}
+_HEADER_ANY = {"DUR", "DURACIÓN"}
 
 def _looks_like_header(row_vals: List[str]) -> bool:
     up = {str(x).strip().upper() for x in row_vals if pd.notna(x)}
-    return HEADER_TOKENS_REQ.issubset(up) and (len(HEADER_TOKENS_ANY.intersection(up)) > 0)
+    return _HEADER_REQ.issubset(up) and (len(_HEADER_ANY.intersection(up)) > 0)
 
 def _read_excel_with_header_sniff(path: str) -> pd.DataFrame:
-    # 1) Cargamos sin encabezado para examinar primeras ~100 filas
     raw = pd.read_excel(path, sheet_name=0, header=None, dtype=str)
-    header_row_idx = None
-    max_probe = min(100, len(raw))
-    for i in range(max_probe):
+    header_row = None
+    for i in range(min(120, len(raw))):
         if _looks_like_header(raw.iloc[i].tolist()):
-            header_row_idx = i
-            break
-    if header_row_idx is not None:
-        headers = raw.iloc[header_row_idx].tolist()
-        df = raw.iloc[header_row_idx+1:].copy()
+            header_row = i; break
+    if header_row is not None:
+        headers = raw.iloc[header_row].tolist()
+        df = raw.iloc[header_row+1:].copy()
         df.columns = headers
-        df = df.dropna(how="all", axis=1).dropna(how="all").reset_index(drop=True)
-        return df
-    # Fallback: primer fila como encabezado
+        return df.dropna(how="all", axis=1).dropna(how="all").reset_index(drop=True)
+    # fallback
     return pd.read_excel(path, sheet_name=0)
 
 def _read_csv_with_header_sniff(path: str) -> pd.DataFrame:
-    # Intento 1: leer normal
     try:
         df = pd.read_csv(path, engine="python")
         if _looks_like_header(list(df.columns)):
             return df
     except Exception:
         pass
-    # Intento 2: leer sin encabezado y buscar la fila correcta
     try:
         raw = pd.read_csv(path, engine="python", header=None, dtype=str)
-        header_row_idx = None
-        max_probe = min(100, len(raw))
-        for i in range(max_probe):
+        header_row = None
+        for i in range(min(120, len(raw))):
             if _looks_like_header(raw.iloc[i].tolist()):
-                header_row_idx = i
-                break
-        if header_row_idx is not None:
-            headers = raw.iloc[header_row_idx].tolist()
-            df = raw.iloc[header_row_idx+1:].copy()
+                header_row = i; break
+        if header_row is not None:
+            headers = raw.iloc[header_row].tolist()
+            df = raw.iloc[header_row+1:].copy()
             df.columns = headers
-            df = df.dropna(how="all", axis=1).dropna(how="all").reset_index(drop=True)
-            return df
+            return df.dropna(how="all", axis=1).dropna(how="all").reset_index(drop=True)
     except Exception:
         pass
-    # Último intento
     return pd.read_csv(path, engine="python", encoding_errors="ignore")
 
 def _read_any_with_sniff(path: str) -> pd.DataFrame:
     ext = os.path.splitext(path)[1].lower()
     if ext in {".xlsx", ".xlsm", ".xls"}:
         if ext == ".xls":
-            # xlrd para xls no soporta header=None con algunos archivos; intentamos normal primero
-            try:
-                return _read_excel_with_header_sniff(path)
-            except Exception:
-                return pd.read_excel(path, engine="xlrd")
+            try: return _read_excel_with_header_sniff(path)
+            except Exception: return pd.read_excel(path, engine="xlrd")
         return _read_excel_with_header_sniff(path)
     elif ext in {".csv", ".txt"}:
         return _read_csv_with_header_sniff(path)
@@ -142,12 +128,12 @@ def _read_any_with_sniff(path: str) -> pd.DataFrame:
 
 # ==================== Modo estricto AT&T ====================
 
+# Conservamos serv/t_reg/tipo_com crudos para derivar Tipo.
 STRICT_ATT_MAP = {
     "no": "registro_id",
     "serv": "serv",
     "t reg": "t_reg", "t_reg": "t_reg",
-    "tipo com": "tipo_com", "tipo_com": "tipo_com",
-    "tipo": "tipo_com",
+    "tipo com": "tipo_com", "tipo_com": "tipo_com", "tipo": "tipo_com",
     "num a": "numero_a", "num_a": "numero_a",
     "num a imsi": "imsi", "num_a_imsi": "imsi",
     "num a imei": "imei", "num_a_imei": "imei",
@@ -170,8 +156,8 @@ _SMS_TOK   = {"sms", "mensaje", "mensajes", "2 vias", "2vias", "mms"}
 _TRF_TOK   = {"transfer", "desvio", "desvío", "call forward", "cfu", "cfb", "cfnry", "cfnr", "cfnrc"}
 
 # Dirección VOZ
-_OUT_TOK = {"mo", "moc", "saliente", "orig", "out", "originating", "salida"}
-_IN_TOK  = {"mt", "mtc", "entrante", "term", "in", "terminating", "entrada"}
+_OUT_TOK   = {"mo", "moc", "saliente", "orig", "out", "originating", "salida"}
+_IN_TOK    = {"mt", "mtc", "entrante", "term", "in", "terminating", "entrada"}
 
 def _norm_text(x: Any) -> str:
     if pd.isna(x): return ""
@@ -179,19 +165,14 @@ def _norm_text(x: Any) -> str:
 
 def derive_tipo_from_serv_treg(serv: Any, t_reg: Any, tipo_com: Any = None) -> Optional[str]:
     s = _norm_text(serv); t = _norm_text(t_reg); c = _norm_text(tipo_com)
-    # Transfer
     if any(tok in s or tok in t or tok in c for tok in _TRF_TOK): return "TRANSFER"
-    # Mensajes
     if any(tok in s or tok in t or tok in c for tok in _SMS_TOK): return "MENSAJES 2 VÍAS"
-    # Datos
     if any(tok in s or tok in t or tok in c for tok in _DATA_TOK): return "DATOS"
-    # Voz + dirección
     is_voice = any(tok in s or tok in c for tok in _VOICE_TOK) or ("call" in t) or ("moc" in t) or ("mtc" in t)
     if is_voice:
         if any(tok in t or tok in s or tok in c for tok in _OUT_TOK): return "VOZ SALIENTE"
         if any(tok in t or tok in s or tok in c for tok in _IN_TOK):  return "VOZ ENTRANTE"
         return "VOZ SALIENTE"
-    # Si T_REG deja claro IN/OUT:
     if any(tok in t for tok in _OUT_TOK): return "VOZ SALIENTE"
     if any(tok in t for tok in _IN_TOK):  return "VOZ ENTRANTE"
     return None
@@ -204,10 +185,7 @@ def _dir_voz(tipo: Optional[str]) -> Optional[str]:
 def _strict_att_normalize(raw_df: pd.DataFrame, tz: Optional[str]) -> pd.DataFrame:
     # 1) Renombrado exacto por normalización
     norm_map = {_norm_colname(c): c for c in raw_df.columns}
-    rename = {}
-    for norm, orig in norm_map.items():
-        if norm in STRICT_ATT_MAP:
-            rename[orig] = STRICT_ATT_MAP[norm]
+    rename = {orig: STRICT_ATT_MAP[norm] for norm, orig in norm_map.items() if norm in STRICT_ATT_MAP}
     df = raw_df.rename(columns=rename).copy()
 
     # 2) Campos base
@@ -215,31 +193,27 @@ def _strict_att_normalize(raw_df: pd.DataFrame, tz: Optional[str]) -> pd.DataFra
     df["Número A"] = df.get("numero_a")
     df["Número B"] = df.get("numero_b")
 
-    # 3) Tipo derivado (SERV + T_REG + TIPO_COM)
-    df["Tipo"] = df.apply(
-        lambda r: derive_tipo_from_serv_treg(r.get("serv"), r.get("t_reg"), r.get("tipo_com")),
-        axis=1
-    )
+    # 3) Tipo derivado
+    df["Tipo"] = df.apply(lambda r: derive_tipo_from_serv_treg(r.get("serv"), r.get("t_reg"), r.get("tipo_com")), axis=1)
     df["Dirección del tráfico (VOZ)"] = df["Tipo"].apply(_dir_voz)
 
-    # 4) Datetime a partir de FECHA/HORA (texto o serial)
-    fecha = df.get("fecha")
-    hora  = df.get("hora")
+    # 4) Datetime (FECHA/HORA: texto, serial, fracción de día o segundos)
+    fecha = df.get("fecha"); hora = df.get("hora")
     dt = pd.Series([pd.NaT]*len(df), dtype="datetime64[ns]")
 
     if fecha is not None:
         f_num = pd.to_numeric(fecha, errors="coerce")
-        f_isnum = f_num.notna()
-        if f_isnum.any():
-            dt[f_isnum] = _excel_days_to_datetime(f_num[f_isnum])
-        if (~f_isnum).any():
-            dt[~f_isnum] = pd.to_datetime(fecha[~f_isnum], errors="coerce", dayfirst=True)
+        mask_num = f_num.notna()
+        if mask_num.any():
+            dt[mask_num] = _excel_days_to_datetime(f_num[mask_num])
+        if (~mask_num).any():
+            dt[~mask_num] = pd.to_datetime(fecha[~mask_num], errors="coerce", dayfirst=True)
+
         if hora is not None:
             h_str = hora.astype(str).str.strip()
-            hhmmss = h_str.str.match(r"^\d{1,2}:[0-5]\d(:[0-5]\d)?$")
-            idx1 = hhmmss & dt.notna()
-            if idx1.any():
-                dt[idx1] = pd.to_datetime(dt[idx1].dt.strftime("%Y-%m-%d") + " " + h_str[idx1], errors="coerce")
+            idx_hms = h_str.str.match(r"^\d{1,2}:[0-5]\d(:[0-5]\d)?$") & dt.notna()
+            if idx_hms.any():
+                dt[idx_hms] = pd.to_datetime(dt[idx_hms].dt.strftime("%Y-%m-%d") + " " + h_str[idx_hms], errors="coerce")
             h_num = pd.to_numeric(h_str, errors="coerce")
             idx_num = h_num.notna() & dt.notna()
             if idx_num.any():
@@ -271,18 +245,14 @@ def _strict_att_normalize(raw_df: pd.DataFrame, tz: Optional[str]) -> pd.DataFra
     else:
         df["Duración (seg)"] = None
 
-    # Identificadores
+    # 6) Identificadores / Radio / Geo
     df["IMEI"] = df.get("imei")
     df["IMSI"] = df.get("imsi")
-
-    # Celda / Radio
     df["LAC_TAC"] = df.get("lac_tac")
     df["CI_ECI"] = df.get("ci_eci")
     df["Tecnología"] = df.get("tecnologia")
     df["Celda"] = df.get("celda")
     df["Azimuth_deg"] = pd.to_numeric(df.get("azimuth_deg"), errors="coerce") if "azimuth_deg" in df.columns else None
-
-    # Geo
     df["Latitud"] = pd.to_numeric(df.get("latitud"), errors="coerce") if "latitud" in df.columns else None
     df["Longitud"] = pd.to_numeric(df.get("longitud"), errors="coerce") if "longitud" in df.columns else None
 
@@ -299,20 +269,20 @@ def _strict_att_normalize(raw_df: pd.DataFrame, tz: Optional[str]) -> pd.DataFra
         df["PLUS_CODE"] = df.get("plus_code")
     df["PLUS_CODE_NOMBRE"] = df.get("plus_code_nombre") if "plus_code_nombre" in df.columns else df.get("direccion")
 
-    # Registro_ID
+    # 7) Registro_ID
     if "registro_id" in df.columns:
         df["Registro_ID"] = pd.to_numeric(df["registro_id"], errors="coerce").astype("Int64")
     else:
         df["Registro_ID"] = pd.Series([pd.NA]*len(df), dtype="Int64")
 
-    # Orden final
+    # 8) Orden final
     cols_final = [
-        "Registro_ID", "Archivo_Origen", "Operador", "Tipo", "Dirección del tráfico (VOZ)",
-        "Número A", "Número B", "Datetime", "Duración (seg)",
-        "IMEI", "IMSI", "Tecnología",
-        "LAC_TAC", "CI_ECI", "Celda", "Azimuth_deg",
-        "Latitud", "Longitud", "PLUS_CODE", "PLUS_CODE_NOMBRE",
+        "Registro_ID","Archivo_Origen","Operador","Tipo","Dirección del tráfico (VOZ)",
+        "Número A","Número B","Datetime","Duración (seg)","IMEI","IMSI","Tecnología",
+        "LAC_TAC","CI_ECI","Celda","Azimuth_deg","Latitud","Longitud","PLUS_CODE","PLUS_CODE_NOMBRE",
     ]
+    if "Dirección del tráfico (VOZ)" not in df.columns:
+        df["Dirección del tráfico (VOZ)"] = df["Tipo"].apply(_dir_voz)
     for c in cols_final:
         if c not in df.columns: df[c] = None
     return df[cols_final]
@@ -326,6 +296,20 @@ class CompileResult:
     dupes: pd.DataFrame
     stats: Dict[str, pd.DataFrame]
     out_xlsx: Optional[str] = None
+
+def _stats(all_df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+    result = {}
+    try:
+        sal = all_df[all_df["Tipo"] == "VOZ SALIENTE"].groupby(["Número A","Número B"], dropna=False) \
+              .size().reset_index(name="Conteo").sort_values("Conteo", ascending=False).head(10)
+        if not sal.empty: result["Top10_Salientes"] = sal
+    except Exception: pass
+    try:
+        ent = all_df[all_df["Tipo"] == "VOZ ENTRANTE"].groupby(["Número A","Número B"], dropna=False) \
+              .size().reset_index(name="Conteo").sort_values("Conteo", ascending=False).head(10)
+        if not ent.empty: result["Top10_Entrantes"] = ent
+    except Exception: pass
+    return result
 
 def compile_att_sabanas_strict(file_paths: List[str], tz: Optional[str]) -> CompileResult:
     frames, logs = [], []
@@ -343,18 +327,19 @@ def compile_att_sabanas_strict(file_paths: List[str], tz: Optional[str]) -> Comp
             })
         except Exception as e:
             logs.append({"archivo": os.path.basename(path), "error": repr(e), "modo": "estricto_AT&T + header-sniff"})
+    log_df = pd.DataFrame(logs)
+
     if not frames:
-        return CompileResult(
-            pd.DataFrame(columns=[
-                "Registro_ID","Archivo_Origen","Operador","Tipo","Dirección del tráfico (VOZ)",
-                "Número A","Número B","Datetime","Duración (seg)","IMEI","IMSI","Tecnología",
-                "LAC_TAC","CI_ECI","Celda","Azimuth_deg","Latitud","Longitud","PLUS_CODE","PLUS_CODE_NOMBRE"
-            ]),
-            pd.DataFrame(logs), pd.DataFrame(), {}, None
-        )
+        empty_cols = [
+            "Registro_ID","Archivo_Origen","Operador","Tipo","Dirección del tráfico (VOZ)",
+            "Número A","Número B","Datetime","Duración (seg)","IMEI","IMSI","Tecnología",
+            "LAC_TAC","CI_ECI","Celda","Azimuth_deg","Latitud","Longitud","PLUS_CODE","PLUS_CODE_NOMBRE"
+        ]
+        return CompileResult(pd.DataFrame(columns=empty_cols), log_df, pd.DataFrame(), {}, None)
+
     all_df = pd.concat(frames, ignore_index=True)
 
-    # Dedupe DATOS/min
+    # Dedupe DATOS/min (conserva el mayor DUR por A/B/min)
     dupes = pd.DataFrame()
     if not all_df.empty and "Tipo" in all_df.columns and "Datetime" in all_df.columns:
         datos = all_df[all_df["Tipo"] == "DATOS"].copy()
@@ -362,10 +347,10 @@ def compile_att_sabanas_strict(file_paths: List[str], tz: Optional[str]) -> Comp
         if not datos.empty:
             datos["_min"] = pd.to_datetime(datos["Datetime"], errors="coerce").dt.floor("min")
             datos["Duración (seg)"] = pd.to_numeric(datos["Duración (seg)"], errors="coerce")
-            idx = datos.sort_values("Duración (seg)", ascending=False).groupby(["Número A", "Número B", "_min"], dropna=False).head(1).index
-            kept = datos.loc[idx]; removed = datos.drop(index=idx)
-            dupes = removed.drop(columns=["_min"], errors="ignore").copy()
-            datos = kept.drop(columns=["_min"], errors="ignore")
+            keep_idx = datos.sort_values("Duración (seg)", ascending=False) \
+                            .groupby(["Número A","Número B","_min"], dropna=False).head(1).index
+            dupes = datos.drop(index=keep_idx).drop(columns=["_min"], errors="ignore")
+            datos = datos.loc[keep_idx].drop(columns=["_min"], errors="ignore")
             all_df = pd.concat([otros, datos], ignore_index=True)
 
     # Registro_ID si faltó
@@ -377,20 +362,10 @@ def compile_att_sabanas_strict(file_paths: List[str], tz: Optional[str]) -> Comp
     if "Datetime" in all_df.columns:
         all_df = all_df.sort_values("Datetime", na_position="last").reset_index(drop=True)
 
-    # Stats simples
-    stats = {}
-    try:
-        sal = all_df[all_df["Tipo"] == "VOZ SALIENTE"].groupby(["Número A","Número B"], dropna=False).size().reset_index(name="Conteo").sort_values("Conteo", ascending=False).head(10)
-        if not sal.empty: stats["Top10_Salientes"] = sal
-    except Exception: pass
-    try:
-        ent = all_df[all_df["Tipo"] == "VOZ ENTRANTE"].groupby(["Número A","Número B"], dropna=False).size().reset_index(name="Conteo").sort_values("Conteo", ascending=False).head(10)
-        if not ent.empty: stats["Top10_Entrantes"] = ent
-    except Exception: pass
+    stats = _stats(all_df)
+    return CompileResult(all_df, log_df, dupes, stats, None)
 
-    return CompileResult(all_df, pd.DataFrame(logs), dupes, stats, None)
-
-# ==================== Hoja extra tipo “669” (con Teléfono) ====================
+# ==================== Hoja extra “669” (columna Teléfono fija) ====================
 
 def build_hoja_669(df: pd.DataFrame, telefono: str) -> pd.DataFrame:
     out_cols = [
@@ -399,7 +374,6 @@ def build_hoja_669(df: pd.DataFrame, telefono: str) -> pd.DataFrame:
         'PLUS_CODE','PLUS_CODE_NOMBRE','Azimuth_deg','Datetime','Es_Duplicado','Cuenta_GrupoDup'
     ]
     res = pd.DataFrame(index=range(len(df)), columns=out_cols)
-
     tel = str(telefono).strip() if telefono else None
     res['Teléfono'] = tel
 
@@ -415,7 +389,7 @@ def build_hoja_669(df: pd.DataFrame, telefono: str) -> pd.DataFrame:
     res['Azimuth_deg'] = df.get('Azimuth_deg')
     res['Datetime'] = pd.to_datetime(df.get('Datetime'), errors='coerce')
 
-    # Raw
+    # Raw y derivados
     res['Latitud_raw'] = df.get('Latitud').astype(str).where(df.get('Latitud').notna(), None)
     res['Longitud_raw'] = df.get('Longitud').astype(str).where(df.get('Longitud').notna(), None)
     res['Azimuth_raw'] = df.get('Azimuth_deg').astype(str).where(df.get('Azimuth_deg').notna(), None)
@@ -464,7 +438,7 @@ def build_excel(df: pd.DataFrame, log: pd.DataFrame, dupes: pd.DataFrame, stats:
 # ==================== UI ====================
 
 st.title("📞 Go Mapper — Compilador AT&T (single-file)")
-st.caption("Detecta el encabezado real, deriva **Tipo** con `SERV+T_REG+TIPO_COM` y puede generar la hoja **Datos_Limpios_669** con la columna **Teléfono** fija.")
+st.caption("Detecta encabezado real, deriva **Tipo** con `SERV+T_REG+TIPO_COM` y puede generar la hoja **Datos_Limpios_669** con la columna **Teléfono** fija.")
 
 st.sidebar.header("Parámetros")
 tz = st.sidebar.text_input("Zona horaria", value="America/Mazatlan")
@@ -504,6 +478,7 @@ if go:
                     res = compile_att_sabanas_strict(tmp_paths, tz=tz)
 
                 st.success(f"✅ Compilado: {len(res.df):,} filas | Archivos: {len(files)}")
+
                 if show_preview:
                     st.subheader("Preview — Datos_Limpios")
                     st.dataframe(res.df.head(500), width="stretch")
