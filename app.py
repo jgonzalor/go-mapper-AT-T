@@ -38,7 +38,7 @@ def norm(s: str) -> str:
     s = re.sub(r"[\s\-\._/]+", " ", s)
     return s
 
-# Sinónimos por campo destino (añade/ajusta libremente)
+# Sinónimos por campo destino (ajústalos libremente)
 SYNONYMS: Dict[str, List[str]] = {
     "Telefono": [
         "telefono", "teléfono", "msisdn", "linea", "línea", "subscriber", "abonado",
@@ -46,7 +46,11 @@ SYNONYMS: Dict[str, List[str]] = {
     ],
     "Tipo": [
         "tipo", "service type", "call type", "evento", "registro", "cdr type", "bearer",
-        "clase", "servicio", "trafico", "tráfico", "usage type", "serv"
+        "clase", "servicio", "trafico", "tráfico", "usage type", "serv"  # ← SERV aquí
+    ],
+    "Dirección (ENT/SAL)": [
+        "t_reg", "t reg", "sentido", "entrada/salida", "in/out", "direccion", "direction", "dir",
+        "sentido llamada", "entrada", "salida", "ent", "sal"
     ],
     "Numero A": [
         "numero a", "a", "origen", "calling", "caller", "calling number", "originating",
@@ -85,6 +89,11 @@ VALUE_MAP_TIPO = {
     "transfer": "TRANSFER", "desvio": "TRANSFER", "desvío": "TRANSFER", "forward": "TRANSFER"
 }
 
+DIR_MAP = {
+    "ent": "ENTRANTE", "entrada": "ENTRANTE", "in": "ENTRANTE", "incoming": "ENTRANTE",
+    "sal": "SALIENTE", "salida": "SALIENTE", "out": "SALIENTE", "outgoing": "SALIENTE"
+}
+
 # =============================================================================
 # MÓDULO: PARSERS Y NORMALIZADORES
 # =============================================================================
@@ -113,7 +122,7 @@ RE_DMS = re.compile(
 )
 
 def dms_to_decimal(s: str) -> Optional[float]:
-    """Convierte '32°27'04"N' o '32 27 04 N' a decimal."""
+    """Convierte '32°27'04\"N' o '32 27 04 N' a decimal."""
     if s is None or (isinstance(s, float) and np.isnan(s)):
         return None
     if isinstance(s, (int, float)):
@@ -142,19 +151,16 @@ def dms_to_decimal(s: str) -> Optional[float]:
     return val
 
 def parse_maybe_dms(x):
-    """Intenta float directo; si no, intenta DMS."""
+    """Intenta float directo; si no, intenta [a:b]/corchetes o DMS."""
     if pd.isna(x) or str(x).strip()=="":
         return np.nan
-    # número directo
     try:
         return float(str(x).replace(",", "."))
     except Exception:
         pass
-    # número dentro de corchetes u 'a:b'
     v = extract_number(x, prefer_last=True)
     if not (v is None or (isinstance(v, float) and math.isnan(v))):
         return v
-    # DMS
     v = dms_to_decimal(str(x))
     return np.nan if v is None else v
 
@@ -165,25 +171,18 @@ def guess_units_and_to_seconds(series: pd.Series) -> pd.Series:
     for v in s:
         if v == "" or v.lower() in ("nan", "none"):
             out.append(np.nan); continue
-        # HH:MM:SS o MM:SS
         if re.match(r"^\d{1,2}:\d{2}(:\d{2})?$", v):
             parts = [int(p) for p in v.split(":")]
-            if len(parts) == 3:
-                sec = parts[0]*3600 + parts[1]*60 + parts[2]
-            else:
+            sec = parts[0]*3600 + parts[1]*60 + (parts[2] if len(parts)==3 else 0 if len(parts)==2 else 0)
+            if len(parts)==2:
                 sec = parts[0]*60 + parts[1]
             out.append(sec); continue
-        # numérico: ¿ms o s?
         try:
             fv = float(v)
-            if fv > 60000:      # típico ms
-                out.append(int(round(fv/1000.0)))
-            else:
-                out.append(int(round(fv)))  # s
+            out.append(int(round(fv/1000.0)) if fv > 60000 else int(round(fv)))
             continue
         except Exception:
             pass
-        # patrón "45s" o "120ms"
         m = re.match(r"^(\d+(?:\.\d+)?)(ms|s)?$", v)
         if m:
             num = float(m.group(1)); unit = (m.group(2) or "s").lower()
@@ -196,7 +195,6 @@ def parse_any_datetime(x: str) -> Optional[pd.Timestamp]:
     if pd.isna(x) or str(x).strip() == "":
         return None
     try:
-        # pandas usa dateutil por debajo; dayfirst=True para MX/EU
         return pd.to_datetime(x, errors="raise", dayfirst=True)
     except Exception:
         return None
@@ -212,8 +210,6 @@ def split_fecha_hora(src_date: Optional[pd.Series], src_time: Optional[pd.Series
             vd = vt
         if src_time is None and src_date is not None:
             vt = vd
-
-        # Si apuntan a la misma, parseamos una sola
         if (src_date is None) or (src_time is None) or (src_date is src_time):
             dt = parse_any_datetime(vt)
             if dt is None:
@@ -222,8 +218,6 @@ def split_fecha_hora(src_date: Optional[pd.Series], src_time: Optional[pd.Series
                 fecha_out.append(dt.strftime("%Y-%m-%d"))
                 hora_out.append(dt.strftime("%H:%M:%S"))
                 continue
-
-        # Si están separadas, intentamos combinarlas
         val = f"{vd} {vt}".strip()
         dt = parse_any_datetime(val)
         if dt is None:
@@ -232,7 +226,6 @@ def split_fecha_hora(src_date: Optional[pd.Series], src_time: Optional[pd.Series
             fecha_out.append(dt.strftime("%Y-%m-%d"))
             hora_out.append(dt.strftime("%H:%M:%S"))
             continue
-
         fecha_out.append("")
         hora_out.append("")
     return pd.Series(fecha_out), pd.Series(hora_out)
@@ -250,6 +243,29 @@ def normalize_tipo(s: pd.Series) -> pd.Series:
         out.append(found if found else s.astype(str).str.strip())
     return pd.Series(out, index=s.index).astype(str)
 
+def normalize_direction(s: pd.Series) -> pd.Series:
+    x = s.astype(str).str.lower().str.strip()
+    out = []
+    for v in x:
+        found = ""
+        for k, val in DIR_MAP.items():
+            if v == k or k in v:
+                found = val; break
+        out.append(found)
+    return pd.Series(out, index=s.index).astype(str)
+
+def compose_tipo(serv: pd.Series, dire: pd.Series, include_data_dir: bool) -> pd.Series:
+    res = []
+    for s, d in zip(serv.astype(str), dire.astype(str)):
+        if d == "" or d.lower() == "nan":
+            res.append(s)
+        else:
+            if s == "DATOS" and not include_data_dir:
+                res.append(s)
+            else:
+                res.append(f"{s} {d}")
+    return pd.Series(res, index=serv.index)
+
 def normalize_msisdn_mx(s: pd.Series, enable: bool) -> pd.Series:
     if not enable:
         return s.astype(str).str.strip()
@@ -266,24 +282,28 @@ def normalize_msisdn_mx(s: pd.Series, enable: bool) -> pd.Series:
         out.append("+" + digits)
     return pd.Series(out, index=s.index)
 
+def to_int64_digits(s: pd.Series) -> pd.Series:
+    """Convierte a enteros (solo dígitos) preservando NA."""
+    return pd.to_numeric(s.astype(str).str.replace(r"\D+", "", regex=True),
+                         errors="coerce").astype("Int64")
+
 # =============================================================================
 # MÓDULO: AUTODETECCIÓN / SUGERENCIA DE MAPEO
 # =============================================================================
 from difflib import get_close_matches
 
-def suggest_mapping(src_cols: List[str]) -> Dict[str, Optional[str]]:
+def suggest_mapping(src_cols: List[str], targets: List[str]) -> Dict[str, Optional[str]]:
     norm_src = {norm(c): c for c in src_cols}
-    mapping = {t: None for t in TARGET_COLUMNS}
+    mapping = {t: None for t in targets}
 
-    for tgt, alias_list in SYNONYMS.items():
+    for tgt in targets:
+        alias_list = SYNONYMS.get(tgt, [])
         chosen = None
-        # match directo por alias
         for alias in alias_list:
             a = norm(alias)
             if a in norm_src:
                 chosen = norm_src[a]; break
-        # aproximado
-        if not chosen:
+        if not chosen and alias_list:
             candidates = get_close_matches(
                 norm("|".join(alias_list)), list(norm_src.keys()), n=1, cutoff=0.85
             )
@@ -293,13 +313,11 @@ def suggest_mapping(src_cols: List[str]) -> Dict[str, Optional[str]]:
         if not chosen and tgt == "Numero A":
             for key in ("a", "a party", "a_number", "from", "num_a"):
                 k = norm(key)
-                if k in norm_src:
-                    chosen = norm_src[k]; break
+                if k in norm_src: chosen = norm_src[k]; break
         if not chosen and tgt == "Numero B":
             for key in ("b", "b party", "b_number", "to", "dest"):
                 k = norm(key)
-                if k in norm_src:
-                    chosen = norm_src[k]; break
+                if k in norm_src: chosen = norm_src[k]; break
         mapping[tgt] = chosen
     return mapping
 
@@ -307,8 +325,8 @@ def suggest_mapping(src_cols: List[str]) -> Dict[str, Optional[str]]:
 # MÓDULO: UI – SIDEBAR / OPCIONES
 # =============================================================================
 st.title(APP_TITLE)
-st.caption("Mapea cualquier CDR (AT&T, otros) al esquema TELCEL_CRUDO de 11 columnas. "
-           "Incluye normalización de teléfonos, fechas/horas, duración y coordenadas (con soporte para valores entre corchetes).")
+st.caption("Mapea cualquier CDR (AT&T u otros) al esquema TELCEL_CRUDO de 11 columnas. "
+           "Incluye normalización de teléfonos, fechas/horas, duración, coordenadas y combinación SERV+T_REG.")
 
 with st.sidebar:
     st.markdown("### Opciones de normalización")
@@ -318,12 +336,14 @@ with st.sidebar:
     opt_prefer_last_in_brackets = st.checkbox("Si LAT/LON/Azimuth vienen como [a:b], tomar el último valor", value=True)
 
     st.markdown("---")
-    st.markdown("### Salida")
-    out_name = st.text_input("Nombre base del archivo de salida", value="CRUDO_UNIFICADO")
+    st.markdown("### Composición de Tipo (SERV + T_REG)")
+    opt_add_dir_to_tipo = st.checkbox("Agregar ENT/SAL a VOZ y MENSAJES 2 VÍAS", value=True)
+    opt_add_dir_to_datos = st.checkbox("Agregar ENT/SAL también a DATOS", value=False)
 
     st.markdown("---")
-    st.markdown("### Recetas (opcional)")
-    recipe_upload = st.file_uploader("Cargar receta JSON", type=["json"], key="recipe_upl")
+    st.markdown("### Exportación")
+    opt_export_ab_int = st.checkbox("Exportar Numero A / Numero B como enteros (sin decimales)", value=True)
+    out_name = st.text_input("Nombre base del archivo de salida", value="CRUDO_UNIFICADO")
 
     st.info(
         "- Si Fecha y Hora vienen en una sola columna, selecciónala en cualquiera; el parser la dividirá.\n"
@@ -345,7 +365,6 @@ def read_any(file):
         return df
     else:
         content = file.getvalue().decode("utf-8", errors="ignore")
-        # autodetectar separador
         sep_counts = {",": content.count(","), "\t": content.count("\t"), ";": content.count(";")}
         sep = max(sep_counts, key=sep_counts.get)
         df = pd.read_csv(io.StringIO(content), sep=sep)
@@ -362,34 +381,22 @@ if file:
     st.write(list(df.columns))
 
     # =============================================================================
-    # MÓDULO: CARGA / APLICACIÓN DE RECETA
-    # =============================================================================
-    pre_mapping = None
-    if recipe_upload is not None:
-        try:
-            pre_mapping_json = json.load(recipe_upload)
-            if isinstance(pre_mapping_json, dict):
-                pre_mapping = pre_mapping_json.get("mapping")
-        except Exception:
-            st.warning("No se pudo leer la receta JSON. Se ignorará.")
-
-    # =============================================================================
     # MÓDULO: EDITOR DE MAPEO
     # =============================================================================
     st.subheader("2) Mapeo de columnas (editable)")
 
-    suggested = suggest_mapping(list(df.columns))
-    if pre_mapping:
-        # sobreescribe sugerencias con receta
-        for k, v in pre_mapping.items():
-            if v in df.columns or v is None:
-                suggested[k] = v
+    # Campos a mapear (incluimos Dirección adicional para T_REG)
+    MAPPING_FIELDS = [
+        "Telefono", "Tipo", "Dirección (ENT/SAL)", "Numero A", "Numero B", "Fecha",
+        "Hora", "Durac. Seg.", "IMEI", "LATITUD", "LONGITUD", "Azimuth"
+    ]
 
+    suggested = suggest_mapping(list(df.columns), MAPPING_FIELDS)
     cols_ui = st.columns(3)
     mapping_user: Dict[str, Optional[str]] = {}
     choices = ["<vacío>"] + list(df.columns)
 
-    for idx, tgt in enumerate(TARGET_COLUMNS):
+    for idx, tgt in enumerate(MAPPING_FIELDS):
         default = suggested.get(tgt)
         default_idx = choices.index(default) if default in choices else 0
         mapping_user[tgt] = cols_ui[idx % 3].selectbox(
@@ -398,19 +405,18 @@ if file:
         if mapping_user[tgt] == "<vacío>":
             mapping_user[tgt] = None
 
-    # Guardar receta (descargable)
+    # Guardar receta
     recipe = {"target": "TELCEL_CRUDO", "mapping": mapping_user}
     recipe_bytes = json.dumps(recipe, ensure_ascii=False, indent=2).encode("utf-8")
     st.download_button("💾 Descargar receta JSON", recipe_bytes, file_name="receta_compilador.json")
 
     # =============================================================================
-    # MÓDULO: CONVERSIÓN Y PREVISUALIZACIÓN
+    # MÓDULO: CONVERSIÓN / NORMALIZACIÓN
     # =============================================================================
     st.subheader("3) Conversión / Normalización")
 
     if st.button("Convertir y Normalizar", type="primary"):
         log_rows = []
-        out = pd.DataFrame(columns=TARGET_COLUMNS)
 
         def col_or_empty(sel: Optional[str]) -> pd.Series:
             if sel is None or sel not in df.columns:
@@ -418,7 +424,8 @@ if file:
             return df[sel]
 
         s_tel = col_or_empty(mapping_user["Telefono"]).astype(str)
-        s_tipo = col_or_empty(mapping_user["Tipo"]).astype(str)
+        s_tipo_serv = col_or_empty(mapping_user["Tipo"]).astype(str)
+        s_dir = col_or_empty(mapping_user["Dirección (ENT/SAL)"]).astype(str)
         s_a   = col_or_empty(mapping_user["Numero A"]).astype(str)
         s_b   = col_or_empty(mapping_user["Numero B"]).astype(str)
         s_f   = col_or_empty(mapping_user["Fecha"])
@@ -435,15 +442,20 @@ if file:
         # Duración
         dur_out = guess_units_and_to_seconds(s_dur)
 
-        # Tipo
-        tipo_out = normalize_tipo(s_tipo)
+        # Tipo (SERV) + Dirección (T_REG)
+        tipo_serv = normalize_tipo(s_tipo_serv)
+        dire_norm = normalize_direction(s_dir)
+        if opt_add_dir_to_tipo or opt_add_dir_to_datos:
+            tipo_out = compose_tipo(tipo_serv, dire_norm, include_data_dir=opt_add_dir_to_datos)
+        else:
+            tipo_out = tipo_serv
 
-        # Teléfonos
+        # Teléfonos (normalización opcional a E.164)
         tel_out = normalize_msisdn_mx(s_tel, opt_norm_msisdn)
         a_out   = normalize_msisdn_mx(s_a, opt_norm_msisdn)
         b_out   = normalize_msisdn_mx(s_b, opt_norm_msisdn)
 
-        # Coordenadas (con soporte [a:b] y DMS)
+        # Coordenadas (corchetes/DMS)
         def coord_any(x):
             v = extract_number(x, prefer_last=opt_prefer_last_in_brackets)
             if pd.isna(v):
@@ -453,7 +465,7 @@ if file:
         lat_out = s_lat.apply(coord_any)
         lon_out = s_lon.apply(coord_any)
 
-        # Tratar 0 como NaN en coordenadas (placeholder)
+        # 0 como NaN
         lat_out = lat_out.where(lat_out != 0, np.nan)
         lon_out = lon_out.where(lon_out != 0, np.nan)
 
@@ -461,21 +473,8 @@ if file:
         if opt_fix_west:
             lon_out = -lon_out.abs()
 
-        # Azimuth (admite [a:b] y num)
-        azi_out = s_azi.apply(lambda x: extract_number(x, prefer_last=opt_prefer_last_in_brackets))
-        # 0° es válido; solo NaN si realmente no hay número
-        azi_out = azi_out.astype(float)
-
-        # Validaciones básicas
-        lat_bad = (~lat_out.between(-90, 90)) & (~lat_out.isna())
-        lon_bad = (~lon_out.between(-180, 180)) & (~lon_out.isna())
-        if lat_bad.any() or lon_bad.any():
-            log_rows.append({"tipo":"WARN","detalle":f"Coordenadas fuera de rango. LAT malas: {int(lat_bad.sum())}, LON malas: {int(lon_bad.sum())}"})
-
-        if opt_drop_empty_coords:
-            keep = ~(lat_out.isna() | lon_out.isna())
-        else:
-            keep = pd.Series([True]*len(df))
+        # Azimuth
+        azi_out = s_azi.apply(lambda x: extract_number(x, prefer_last=opt_prefer_last_in_brackets)).astype(float)
 
         out = pd.DataFrame({
             "Telefono": tel_out,
@@ -489,16 +488,28 @@ if file:
             "LATITUD": lat_out,
             "LONGITUD": lon_out,
             "Azimuth": azi_out
-        })
-        out = out[keep].reset_index(drop=True)
+        }).reset_index(drop=True)
 
-        # LOG de mapeo / nulos
+        # Validaciones y filtros
+        lat_bad = (~out["LATITUD"].between(-90, 90)) & (~out["LATITUD"].isna())
+        lon_bad = (~out["LONGITUD"].between(-180, 180)) & (~out["LONGITUD"].isna())
+        if lat_bad.any() or lon_bad.any():
+            log_rows.append({"tipo":"WARN","detalle":f"Coordenadas fuera de rango. LAT malas: {int(lat_bad.sum())}, LON malas: {int(lon_bad.sum())}"})
+
+        if opt_drop_empty_coords:
+            out = out[~(out["LATITUD"].isna() | out["LONGITUD"].isna())].reset_index(drop=True)
+
+        # Numeración A/B como enteros (sin decimales) si se solicita
+        if opt_export_ab_int:
+            out["Numero A"] = to_int64_digits(out["Numero A"])
+            out["Numero B"] = to_int64_digits(out["Numero B"])
+
+        # LOG
         log_rows.append({"tipo":"INFO","detalle":f"Filas entrada: {len(df)}, filas salida: {len(out)}"})
         log_rows.append({"tipo":"INFO","detalle":f"Mapeo aplicado: {json.dumps(mapping_user, ensure_ascii=False)}"})
         for c in TARGET_COLUMNS:
-            n_nulls = int(out[c].isna().sum() + (out[c] == "").sum())
+            n_nulls = int(out[c].isna().sum() + (out[c] == "").sum()) if c in out.columns else 0
             log_rows.append({"tipo":"NULLS","detalle":f"{c}: {n_nulls} nulos/vacíos"})
-
         log_df = pd.DataFrame(log_rows)
 
         st.success("Conversión realizada.")
@@ -512,6 +523,19 @@ if file:
         with pd.ExcelWriter(bio, engine="xlsxwriter") as writer:
             out.to_excel(writer, sheet_name="CRUDO_UNIFICADO", index=False)
             log_df.to_excel(writer, sheet_name="LOG_Mapeo", index=False)
+
+            # Formato sin decimales para Numero A/B si procede
+            workbook = writer.book
+            ws = writer.sheets["CRUDO_UNIFICADO"]
+            fmt_int = workbook.add_format({"num_format": "0"})
+            try:
+                col_a = out.columns.get_loc("Numero A")
+                col_b = out.columns.get_loc("Numero B")
+                ws.set_column(col_a, col_a, 18, fmt_int)
+                ws.set_column(col_b, col_b, 18, fmt_int)
+            except Exception:
+                pass  # por si los nombres cambian
+
         st.download_button(
             label="⬇️ Descargar Excel (CRUDO_UNIFICADO + LOG)",
             data=bio.getvalue(),
