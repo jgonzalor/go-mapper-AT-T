@@ -1,27 +1,33 @@
 # app_compilador_unico.py
 # -*- coding: utf-8 -*-
+# =============================================================================
+# MÓDULO: CONFIGURACIÓN INICIAL
+# =============================================================================
 import io
 import re
-import sys
 import json
 import math
 import unicodedata
-from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 import streamlit as st
-from dateutil import parser as dtparser
-from difflib import get_close_matches
 
-APP_TITLE = "Compilador Único → Esquema TELCEL_CRUDO (11 columnas)"
+st.set_page_config(
+    page_title="Compilador Único → TELCEL_CRUDO (11 columnas)",
+    layout="wide"
+)
+
+APP_TITLE = "Compilador Único → TELCEL_CRUDO (11 columnas)"
 TARGET_COLUMNS = [
     "Telefono", "Tipo", "Numero A", "Numero B", "Fecha", "Hora",
     "Durac. Seg.", "IMEI", "LATITUD", "LONGITUD", "Azimuth"
 ]
 
-# ---------- Utilidades de texto / matching ----------
+# =============================================================================
+# MÓDULO: SINÓNIMOS / DICCIONARIOS
+# =============================================================================
 def strip_accents(s: str) -> str:
     if not isinstance(s, str):
         s = str(s)
@@ -32,26 +38,29 @@ def norm(s: str) -> str:
     s = re.sub(r"[\s\-\._/]+", " ", s)
     return s
 
-SYNONYMS = {
+# Sinónimos por campo destino (añade/ajusta libremente)
+SYNONYMS: Dict[str, List[str]] = {
     "Telefono": [
         "telefono", "teléfono", "msisdn", "linea", "línea", "subscriber", "abonado",
         "phone", "num subs", "numero de linea", "numero", "account msisdn"
     ],
     "Tipo": [
         "tipo", "service type", "call type", "evento", "registro", "cdr type", "bearer",
-        "clase", "servicio", "trafico", "tráfico", "usage type"
+        "clase", "servicio", "trafico", "tráfico", "usage type", "serv"
     ],
     "Numero A": [
         "numero a", "a", "origen", "calling", "caller", "calling number", "originating",
-        "ani", "calling party", "msc origin", "numero origen", "num a", "from", "source"
+        "ani", "calling party", "msc origin", "numero origen", "num a", "from", "source",
+        "num_a", "a_party"
     ],
     "Numero B": [
         "numero b", "b", "destino", "called", "callee", "b-party", "terminating",
-        "called number", "numero destino", "num b", "to", "target", "destination"
+        "called number", "numero destino", "num b", "to", "target", "destination",
+        "dest", "b_party"
     ],
     "Fecha": [
         "fecha", "date", "start date", "call date", "fecha de la comunicacion",
-        "event date", "fecha inicio", "dia"
+        "event date", "fecha inicio", "dia", "day"
     ],
     "Hora": [
         "hora", "time", "start time", "call time", "timestamp", "hora de la comunicacion",
@@ -59,34 +68,39 @@ SYNONYMS = {
     ],
     "Durac. Seg.": [
         "durac seg", "duracion", "duración", "duration", "duration ms", "duration sec",
-        "call duration", "tiempo", "dur", "duracion s", "dur ms", "dur sec"
+        "call duration", "tiempo", "dur", "duracion s", "dur ms", "dur sec", "durac seg."
     ],
-    "IMEI": ["imei", "imeisv", "equipo", "device id", "handset", "terminal id"],
+    "IMEI": ["imei", "imeisv", "equipo", "device id", "handset", "terminal id", "num_a_imei"],
     "LATITUD": ["latitud", "lat", "latitude", "y", "coord y", "lat dms"],
     "LONGITUD": ["longitud", "lon", "long", "longitude", "x", "coord x", "lon dms"],
-    "Azimuth": ["azimuth", "azimut", "bearing", "az", "angulo", "ángulo", "direction", "sector azimuth"],
+    "Azimuth": ["azimuth", "azimut", "bearing", "az", "angulo", "ángulo", "direction", "sector azimuth", "azimuth_gis", "azimuth°"],
 }
 
 VALUE_MAP_TIPO = {
-    # normalizaciones frecuentes
-    "voice": "VOZ",
-    "voz": "VOZ",
-    "llamada": "VOZ",
-    "call": "VOZ",
-    "data": "DATOS",
-    "datos": "DATOS",
-    "gprs": "DATOS",
-    "4g": "DATOS",
-    "lte": "DATOS",
-    "sms": "MENSAJES 2 VÍAS",
-    "mensajes": "MENSAJES 2 VÍAS",
-    "2vias": "MENSAJES 2 VÍAS",
-    "2 vias": "MENSAJES 2 VÍAS",
-    "transfer": "TRANSFER",
-    "desvio": "TRANSFER",
-    "desvío": "TRANSFER",
-    "forward": "TRANSFER",
+    "voice": "VOZ", "voz": "VOZ", "llamada": "VOZ", "call": "VOZ",
+    "data": "DATOS", "datos": "DATOS", "gprs": "DATOS", "4g": "DATOS", "lte": "DATOS",
+    "sms": "MENSAJES 2 VÍAS", "mensajes": "MENSAJES 2 VÍAS", "esms": "MENSAJES 2 VÍAS",
+    "2vias": "MENSAJES 2 VÍAS", "2 vias": "MENSAJES 2 VÍAS", "smst": "MENSAJES 2 VÍAS",
+    "esms;smst": "MENSAJES 2 VÍAS",
+    "transfer": "TRANSFER", "desvio": "TRANSFER", "desvío": "TRANSFER", "forward": "TRANSFER"
 }
+
+# =============================================================================
+# MÓDULO: PARSERS Y NORMALIZADORES
+# =============================================================================
+NUM_RE = re.compile(r'[-+]?\d+(?:\.\d+)?')
+
+def extract_number(text, prefer_last=True):
+    """Extrae el primer/último número de un texto (sirve para valores en '[]' o 'a:b')."""
+    if pd.isna(text):
+        return np.nan
+    nums = NUM_RE.findall(str(text))
+    if not nums:
+        return np.nan
+    try:
+        return float(nums[-1] if prefer_last else nums[0])
+    except Exception:
+        return np.nan
 
 RE_DMS = re.compile(
     r"""^\s*
@@ -99,6 +113,7 @@ RE_DMS = re.compile(
 )
 
 def dms_to_decimal(s: str) -> Optional[float]:
+    """Convierte '32°27'04"N' o '32 27 04 N' a decimal."""
     if s is None or (isinstance(s, float) and np.isnan(s)):
         return None
     if isinstance(s, (int, float)):
@@ -106,7 +121,6 @@ def dms_to_decimal(s: str) -> Optional[float]:
     txt = str(s).strip()
     m = RE_DMS.match(txt)
     if not m:
-        # también intentamos "DD MM SS H"
         parts = re.split(r"[^\d\.A-Za-z]+", txt)
         parts = [p for p in parts if p]
         if 3 <= len(parts) <= 4:
@@ -128,20 +142,24 @@ def dms_to_decimal(s: str) -> Optional[float]:
     return val
 
 def parse_maybe_dms(x):
-    if pd.isna(x):
+    """Intenta float directo; si no, intenta DMS."""
+    if pd.isna(x) or str(x).strip()=="":
         return np.nan
-    # si ya es número "normal"
+    # número directo
     try:
-        val = float(str(x).replace(",", "."))
-        return val
+        return float(str(x).replace(",", "."))
     except Exception:
         pass
-    # intentar DMS
+    # número dentro de corchetes u 'a:b'
+    v = extract_number(x, prefer_last=True)
+    if not (v is None or (isinstance(v, float) and math.isnan(v))):
+        return v
+    # DMS
     v = dms_to_decimal(str(x))
     return np.nan if v is None else v
 
 def guess_units_and_to_seconds(series: pd.Series) -> pd.Series:
-    """Convierte duraciones a segundos desde varias formas."""
+    """Convierte duraciones a segundos desde hh:mm:ss, mm:ss, ms, s."""
     s = series.astype(str).str.strip()
     out = []
     for v in s:
@@ -158,20 +176,14 @@ def guess_units_and_to_seconds(series: pd.Series) -> pd.Series:
         # numérico: ¿ms o s?
         try:
             fv = float(v)
-            if fv > 1e6:  # demasiado grande, probablemente ms acumulados
-                out.append(int(round(fv/1000.0)))
-            elif fv > 60000:  # > 60k => ms
-                out.append(int(round(fv/1000.0)))
-            elif fv > 10000 and fv < 60000:
-                # entre 10k y 60k: ambiguo pero suele ser ms
+            if fv > 60000:      # típico ms
                 out.append(int(round(fv/1000.0)))
             else:
-                # ya está en segundos
-                out.append(int(round(fv)))
+                out.append(int(round(fv)))  # s
             continue
         except Exception:
             pass
-        # palabras tipo "45s" o "120ms"
+        # patrón "45s" o "120ms"
         m = re.match(r"^(\d+(?:\.\d+)?)(ms|s)?$", v)
         if m:
             num = float(m.group(1)); unit = (m.group(2) or "s").lower()
@@ -180,28 +192,17 @@ def guess_units_and_to_seconds(series: pd.Series) -> pd.Series:
         out.append(np.nan)
     return pd.Series(out, index=series.index, dtype="Int64").astype("float").astype("Int64")
 
-def parse_any_datetime(x) -> Optional[datetime]:
+def parse_any_datetime(x: str) -> Optional[pd.Timestamp]:
     if pd.isna(x) or str(x).strip() == "":
         return None
-    # pandas ya reconoce muchos formatos
     try:
-        dt = pd.to_datetime(x, errors="raise", dayfirst=True)
-        if isinstance(dt, pd.Series):
-            dt = dt.iloc[0]
-        return dt.to_pydatetime()
-    except Exception:
-        pass
-    # dateutil como fallback
-    try:
-        return dtparser.parse(str(x), dayfirst=True, fuzzy=True)
+        # pandas usa dateutil por debajo; dayfirst=True para MX/EU
+        return pd.to_datetime(x, errors="raise", dayfirst=True)
     except Exception:
         return None
 
 def split_fecha_hora(src_date: Optional[pd.Series], src_time: Optional[pd.Series]) -> Tuple[pd.Series, pd.Series]:
-    """
-    Dado columnas de fecha y hora (o una sola combinada), devuelve dos series string: Fecha (YYYY-MM-DD) y Hora (HH:MM:SS).
-    Si el usuario eligió la misma columna para Fecha y Hora, se parte automáticamente.
-    """
+    """Si Fecha/Hora están juntas, las divide; si están separadas, las combina."""
     n = max(len(src_date) if src_date is not None else 0, len(src_time) if src_time is not None else 0)
     fecha_out, hora_out = [], []
     for i in range(n):
@@ -211,26 +212,27 @@ def split_fecha_hora(src_date: Optional[pd.Series], src_time: Optional[pd.Series
             vd = vt
         if src_time is None and src_date is not None:
             vt = vd
-        # si ambas referencian la misma fuente, parsear una sola
-        val = vt if (src_date is None or src_time is None or src_date is src_time) else None
-        if val is not None:
-            dt = parse_any_datetime(val)
-            if dt:
+
+        # Si apuntan a la misma, parseamos una sola
+        if (src_date is None) or (src_time is None) or (src_date is src_time):
+            dt = parse_any_datetime(vt)
+            if dt is None:
+                dt = parse_any_datetime(vd)
+            if dt is not None:
                 fecha_out.append(dt.strftime("%Y-%m-%d"))
                 hora_out.append(dt.strftime("%H:%M:%S"))
                 continue
-        # combinar cuando vienen separadas
-        if (vd is not None) or (vt is not None):
-            try:
-                dt = parse_any_datetime(f"{vd} {vt}")
-            except Exception:
-                dt = None
-            if not dt:
-                dt = parse_any_datetime(vd) or parse_any_datetime(vt)
-            if dt:
-                fecha_out.append(dt.strftime("%Y-%m-%d"))
-                hora_out.append(dt.strftime("%H:%M:%S"))
-                continue
+
+        # Si están separadas, intentamos combinarlas
+        val = f"{vd} {vt}".strip()
+        dt = parse_any_datetime(val)
+        if dt is None:
+            dt = parse_any_datetime(vd) or parse_any_datetime(vt)
+        if dt is not None:
+            fecha_out.append(dt.strftime("%Y-%m-%d"))
+            hora_out.append(dt.strftime("%H:%M:%S"))
+            continue
+
         fecha_out.append("")
         hora_out.append("")
     return pd.Series(fecha_out), pd.Series(hora_out)
@@ -239,10 +241,8 @@ def normalize_tipo(s: pd.Series) -> pd.Series:
     x = s.astype(str).str.lower().str.strip()
     out = []
     for v in x:
-        vv = VALUE_MAP_TIPO.get(v)
-        if vv:
-            out.append(vv); continue
-        # búsqueda por contiene
+        if v in VALUE_MAP_TIPO:
+            out.append(VALUE_MAP_TIPO[v]); continue
         found = None
         for k, val in VALUE_MAP_TIPO.items():
             if k in v:
@@ -259,19 +259,18 @@ def normalize_msisdn_mx(s: pd.Series, enable: bool) -> pd.Series:
         if digits == "":
             out.append("")
             continue
-        # si ya viene con 52 al inicio y 10 siguientes
         if digits.startswith("52") and len(digits) >= 12:
-            out.append("+" + digits)
-            continue
-        # si trae 10 dígitos locales, añadir +52
+            out.append("+" + digits); continue
         if len(digits) == 10:
-            out.append("+52" + digits)
-            continue
-        # otros largos: devolver con +
+            out.append("+52" + digits); continue
         out.append("+" + digits)
     return pd.Series(out, index=s.index)
 
-# ---------- Sugerencia de mapeo ----------
+# =============================================================================
+# MÓDULO: AUTODETECCIÓN / SUGERENCIA DE MAPEO
+# =============================================================================
+from difflib import get_close_matches
+
 def suggest_mapping(src_cols: List[str]) -> Dict[str, Optional[str]]:
     norm_src = {norm(c): c for c in src_cols}
     mapping = {t: None for t in TARGET_COLUMNS}
@@ -283,77 +282,109 @@ def suggest_mapping(src_cols: List[str]) -> Dict[str, Optional[str]]:
             a = norm(alias)
             if a in norm_src:
                 chosen = norm_src[a]; break
+        # aproximado
         if not chosen:
-            # buscar coincidencia aproximada
             candidates = get_close_matches(
-                norm("|".join(alias_list)), list(norm_src.keys()), n=1, cutoff=0.8
+                norm("|".join(alias_list)), list(norm_src.keys()), n=1, cutoff=0.85
             )
             if candidates:
                 chosen = norm_src[candidates[0]]
-        # heurísticas simples A/B
-        if not chosen:
-            if tgt == "Numero A":
-                for key in ("a", "a party", "a_number", "from"):
-                    k = norm(key)
-                    if k in norm_src:
-                        chosen = norm_src[k]; break
-            if tgt == "Numero B":
-                for key in ("b", "b party", "b_number", "to"):
-                    k = norm(key)
-                    if k in norm_src:
-                        chosen = norm_src[k]; break
+        # heurísticas A/B
+        if not chosen and tgt == "Numero A":
+            for key in ("a", "a party", "a_number", "from", "num_a"):
+                k = norm(key)
+                if k in norm_src:
+                    chosen = norm_src[k]; break
+        if not chosen and tgt == "Numero B":
+            for key in ("b", "b party", "b_number", "to", "dest"):
+                k = norm(key)
+                if k in norm_src:
+                    chosen = norm_src[k]; break
         mapping[tgt] = chosen
     return mapping
 
-# ---------- UI ----------
-st.set_page_config(page_title=APP_TITLE, layout="wide")
+# =============================================================================
+# MÓDULO: UI – SIDEBAR / OPCIONES
+# =============================================================================
 st.title(APP_TITLE)
-st.caption("Sube cualquier CDR (CSV/Excel). Mapea columnas al esquema objetivo y normaliza formatos.")
+st.caption("Mapea cualquier CDR (AT&T, otros) al esquema TELCEL_CRUDO de 11 columnas. "
+           "Incluye normalización de teléfonos, fechas/horas, duración y coordenadas (con soporte para valores entre corchetes).")
 
 with st.sidebar:
-    st.markdown("### Opciones")
+    st.markdown("### Opciones de normalización")
     opt_norm_msisdn = st.checkbox("Normalizar teléfonos a E.164 MX (+52…)", value=False)
     opt_fix_west = st.checkbox("Forzar LONGITUD negativa (hemisferio Oeste)", value=True)
     opt_drop_empty_coords = st.checkbox("Descartar filas sin coordenadas válidas", value=False)
+    opt_prefer_last_in_brackets = st.checkbox("Si LAT/LON/Azimuth vienen como [a:b], tomar el último valor", value=True)
+
     st.markdown("---")
-    st.markdown("**Salida**")
+    st.markdown("### Salida")
     out_name = st.text_input("Nombre base del archivo de salida", value="CRUDO_UNIFICADO")
+
     st.markdown("---")
-    st.markdown("**Ayuda rápida**")
+    st.markdown("### Recetas (opcional)")
+    recipe_upload = st.file_uploader("Cargar receta JSON", type=["json"], key="recipe_upl")
+
     st.info(
-        "- Si Fecha y Hora vienen en una sola columna, selecciónala en cualquiera de las dos; el parser la dividirá.\n"
+        "- Si Fecha y Hora vienen en una sola columna, selecciónala en cualquiera; el parser la dividirá.\n"
         "- Duración acepta hh:mm:ss, mm:ss, ms o segundos.\n"
-        "- LAT/LON en DMS tipo `32°27'04\"N` también se convierten."
+        "- LAT/LON en DMS o con corchetes tipo `[23.24:23.25]` se convierten automáticamente."
     )
 
-file = st.file_uploader("Sube un archivo .xlsx/.xls/.csv/.txt", type=["xlsx","xls","csv","txt"])
+# =============================================================================
+# MÓDULO: CARGA DE ARCHIVO
+# =============================================================================
+file = st.file_uploader("Sube un CDR .xlsx/.xls/.csv/.txt", type=["xlsx","xls","csv","txt"])
+
+def read_any(file):
+    ext = file.name.lower().split(".")[-1]
+    if ext in ("xlsx", "xls"):
+        xls = pd.ExcelFile(file)
+        sh = st.selectbox("Hoja de Excel", xls.sheet_names, index=0)
+        df = pd.read_excel(file, sheet_name=sh)
+        return df
+    else:
+        content = file.getvalue().decode("utf-8", errors="ignore")
+        # autodetectar separador
+        sep_counts = {",": content.count(","), "\t": content.count("\t"), ";": content.count(";")}
+        sep = max(sep_counts, key=sep_counts.get)
+        df = pd.read_csv(io.StringIO(content), sep=sep)
+        return df
 
 if file:
-    # lectura
-    ext = file.name.lower().split(".")[-1]
     try:
-        if ext in ("xlsx", "xls"):
-            sheet = st.text_input("Nombre de hoja (en blanco para la primera)", value="")
-            if sheet.strip():
-                df = pd.read_excel(file, sheet_name=sheet.strip())
-            else:
-                df = pd.read_excel(file)
-        else:
-            # autodetectar separador
-            content = file.getvalue().decode("utf-8", errors="ignore")
-            sep = "," if content.count(",") >= content.count("\t") else "\t"
-            df = pd.read_csv(io.StringIO(content), sep=sep)
+        df = read_any(file)
     except Exception as e:
         st.error(f"Error leyendo archivo: {e}")
         st.stop()
 
-    st.subheader("1) Vista de columnas detectadas")
+    st.subheader("1) Columnas detectadas")
     st.write(list(df.columns))
 
-    # sugerencia de mapeo
-    suggested = suggest_mapping(list(df.columns))
+    # =============================================================================
+    # MÓDULO: CARGA / APLICACIÓN DE RECETA
+    # =============================================================================
+    pre_mapping = None
+    if recipe_upload is not None:
+        try:
+            pre_mapping_json = json.load(recipe_upload)
+            if isinstance(pre_mapping_json, dict):
+                pre_mapping = pre_mapping_json.get("mapping")
+        except Exception:
+            st.warning("No se pudo leer la receta JSON. Se ignorará.")
 
+    # =============================================================================
+    # MÓDULO: EDITOR DE MAPEO
+    # =============================================================================
     st.subheader("2) Mapeo de columnas (editable)")
+
+    suggested = suggest_mapping(list(df.columns))
+    if pre_mapping:
+        # sobreescribe sugerencias con receta
+        for k, v in pre_mapping.items():
+            if v in df.columns or v is None:
+                suggested[k] = v
+
     cols_ui = st.columns(3)
     mapping_user: Dict[str, Optional[str]] = {}
     choices = ["<vacío>"] + list(df.columns)
@@ -367,12 +398,20 @@ if file:
         if mapping_user[tgt] == "<vacío>":
             mapping_user[tgt] = None
 
-    st.subheader("3) Previsualización / Conversión")
+    # Guardar receta (descargable)
+    recipe = {"target": "TELCEL_CRUDO", "mapping": mapping_user}
+    recipe_bytes = json.dumps(recipe, ensure_ascii=False, indent=2).encode("utf-8")
+    st.download_button("💾 Descargar receta JSON", recipe_bytes, file_name="receta_compilador.json")
+
+    # =============================================================================
+    # MÓDULO: CONVERSIÓN Y PREVISUALIZACIÓN
+    # =============================================================================
+    st.subheader("3) Conversión / Normalización")
+
     if st.button("Convertir y Normalizar", type="primary"):
         log_rows = []
         out = pd.DataFrame(columns=TARGET_COLUMNS)
 
-        # helper para tomar serie fuente o serie vacía
         def col_or_empty(sel: Optional[str]) -> pd.Series:
             if sel is None or sel not in df.columns:
                 return pd.Series([""] * len(df))
@@ -390,10 +429,10 @@ if file:
         s_lon = col_or_empty(mapping_user["LONGITUD"])
         s_azi = col_or_empty(mapping_user["Azimuth"])
 
-        # Fecha/Hora
+        # Fecha y Hora
         fecha_out, hora_out = split_fecha_hora(s_f, s_h)
 
-        # Duración → seg
+        # Duración
         dur_out = guess_units_and_to_seconds(s_dur)
 
         # Tipo
@@ -404,12 +443,28 @@ if file:
         a_out   = normalize_msisdn_mx(s_a, opt_norm_msisdn)
         b_out   = normalize_msisdn_mx(s_b, opt_norm_msisdn)
 
-        # Coordenadas
-        lat_out = s_lat.apply(parse_maybe_dms)
-        lon_out = s_lon.apply(parse_maybe_dms)
+        # Coordenadas (con soporte [a:b] y DMS)
+        def coord_any(x):
+            v = extract_number(x, prefer_last=opt_prefer_last_in_brackets)
+            if pd.isna(v):
+                v = parse_maybe_dms(x)
+            return v
+
+        lat_out = s_lat.apply(coord_any)
+        lon_out = s_lon.apply(coord_any)
+
+        # Tratar 0 como NaN en coordenadas (placeholder)
+        lat_out = lat_out.where(lat_out != 0, np.nan)
+        lon_out = lon_out.where(lon_out != 0, np.nan)
+
+        # Hemisferio Oeste (MX)
         if opt_fix_west:
-            # México y región: longitudes negativas
             lon_out = -lon_out.abs()
+
+        # Azimuth (admite [a:b] y num)
+        azi_out = s_azi.apply(lambda x: extract_number(x, prefer_last=opt_prefer_last_in_brackets))
+        # 0° es válido; solo NaN si realmente no hay número
+        azi_out = azi_out.astype(float)
 
         # Validaciones básicas
         lat_bad = (~lat_out.between(-90, 90)) & (~lat_out.isna())
@@ -422,14 +477,6 @@ if file:
         else:
             keep = pd.Series([True]*len(df))
 
-        # Azimuth → num
-        def to_num(x):
-            try:
-                return float(str(x).replace(",", "."))
-            except Exception:
-                return np.nan
-        azi_out = s_azi.apply(to_num)
-
         out = pd.DataFrame({
             "Telefono": tel_out,
             "Tipo": tipo_out,
@@ -438,28 +485,29 @@ if file:
             "Fecha": fecha_out,
             "Hora": hora_out,
             "Durac. Seg.": dur_out.astype("Int64"),
-            "IMEI": s_imei.str.replace(r"\.0$", "", regex=True).str.strip(),
+            "IMEI": s_imei.str.replace(r"\.0$", "", regex=True).str.strip().replace({"nan": ""}),
             "LATITUD": lat_out,
             "LONGITUD": lon_out,
             "Azimuth": azi_out
         })
         out = out[keep].reset_index(drop=True)
 
-        # LOG de mapeo
+        # LOG de mapeo / nulos
         log_rows.append({"tipo":"INFO","detalle":f"Filas entrada: {len(df)}, filas salida: {len(out)}"})
         log_rows.append({"tipo":"INFO","detalle":f"Mapeo aplicado: {json.dumps(mapping_user, ensure_ascii=False)}"})
-
-        # nulos por campo
         for c in TARGET_COLUMNS:
-            log_rows.append({"tipo":"NULLS","detalle":f"{c}: {int(out[c].isna().sum() + (out[c]=='').sum())} nulos/vacíos"})
+            n_nulls = int(out[c].isna().sum() + (out[c] == "").sum())
+            log_rows.append({"tipo":"NULLS","detalle":f"{c}: {n_nulls} nulos/vacíos"})
 
         log_df = pd.DataFrame(log_rows)
 
         st.success("Conversión realizada.")
         st.markdown("**Vista previa (primeras 100 filas):**")
-        st.dataframe(out.head(100))
+        st.dataframe(out.head(100), use_container_width=True)
 
-        # Descargar Excel con LOG
+        # =============================================================================
+        # MÓDULO: EXPORTACIÓN
+        # =============================================================================
         bio = io.BytesIO()
         with pd.ExcelWriter(bio, engine="xlsxwriter") as writer:
             out.to_excel(writer, sheet_name="CRUDO_UNIFICADO", index=False)
@@ -471,12 +519,12 @@ if file:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
-        # También CSV
         st.download_button(
             label="⬇️ Descargar CSV (solo datos)",
             data=out.to_csv(index=False).encode("utf-8"),
             file_name=f"{out_name}.csv",
             mime="text/csv"
         )
+
 else:
     st.info("Sube un CDR para comenzar. Soporta .xlsx/.xls/.csv/.txt.")
